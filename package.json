@@ -1,12 +1,17 @@
 {
   "name": "nashmi-store-bot",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "canvas": "^2.11.2",
     "discord.js": "^14.27.0",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
