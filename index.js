@@ -1,5 +1,9 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v3
+   NashmiMC Store Bot — Production Build v4
+   - PostgreSQL persistence (replaces JSON file)
+   - Auto-invoice image for PayPal
+   - USDT payment proof images
+   - Full sanitization + rate limiting
    ========================================================= */
 
 'use strict';
@@ -15,9 +19,7 @@ const {
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 let createCanvas;
 try {
@@ -43,7 +45,7 @@ const PAYPAL_BASE_URL = PAYPAL_MODE === 'sandbox'
     : 'https://api-m.paypal.com';
 
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
-const ORDERS_FILE = process.env.ORDERS_FILE || path.join(__dirname, 'orders.json');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 
 /* =========================================================
    PRODUCT CATALOG
@@ -92,57 +94,187 @@ const VALID_COUPON = 'NASHMI2026';
 const COUPON_DISCOUNT = 0.15;
 
 /* =========================================================
-   PERSISTENCE
+   POSTGRESQL POOL
    ========================================================= */
-let ordersDatabase = [];
-const pendingPayPalOrders = new Map();
+let db = null;
+let dbReady = false;
 
-function loadOrdersFromDisk() {
+if (DATABASE_URL) {
+    db = new Pool({
+        connectionString: DATABASE_URL,
+        ssl: DATABASE_URL.includes('render.com') || process.env.PGSSLMODE === 'require'
+            ? { rejectUnauthorized: false }
+            : false,
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000
+    });
+
+    db.on('error', (err) => {
+        console.error('[DB] Unexpected pool error:', err.message);
+    });
+} else {
+    console.warn('[DB] DATABASE_URL is not set. PostgreSQL is disabled.');
+}
+
+/* =========================================================
+   DATABASE INIT
+   ========================================================= */
+async function initDatabase() {
+    if (!db) return;
+
     try {
-        if (fs.existsSync(ORDERS_FILE)) {
-            const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-                ordersDatabase = parsed;
-                console.log(`[STORE] Loaded ${ordersDatabase.length} orders from disk.`);
-            }
-        }
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS orders (
+                id                VARCHAR(64) PRIMARY KEY,
+                ign               VARCHAR(16) NOT NULL,
+                discord_user      VARCHAR(64) NOT NULL,
+                payment_method    VARCHAR(16) NOT NULL,
+                payment_reference VARCHAR(255),
+                subtotal          NUMERIC(10, 2) NOT NULL,
+                total             NUMERIC(10, 2) NOT NULL,
+                coupon_code       VARCHAR(32),
+                items             JSONB NOT NULL,
+                status            VARCHAR(32) NOT NULL DEFAULT 'قيد الانتظار',
+                paypal_order_id   VARCHAR(128),
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_orders_paypal_order_id ON orders (paypal_order_id)`);
+
+        dbReady = true;
+        console.log('[DB] Connected and schema ready.');
+
+        const result = await db.query('SELECT COUNT(*)::int AS count FROM orders');
+        console.log(`[DB] Orders in database: ${result.rows[0].count}`);
     } catch (err) {
-        console.error('[STORE] Failed to load orders:', err.message);
+        console.error('[DB] Init failed:', err.message);
+        dbReady = false;
     }
 }
 
-let saveDebounceTimer = null;
-
-function saveOrdersToDisk() {
-    clearTimeout(saveDebounceTimer);
-    saveDebounceTimer = setTimeout(() => {
-        try {
-            const trimmed = ordersDatabase.slice(0, 1000);
-            fs.writeFileSync(ORDERS_FILE, JSON.stringify(trimmed, null, 2), 'utf8');
-        } catch (err) {
-            console.error('[STORE] Failed to save orders:', err.message);
-        }
-    }, 200);
+function rowToOrder(row) {
+    return {
+        id: row.id,
+        ign: row.ign,
+        discordUser: row.discord_user,
+        paymentMethod: row.payment_method,
+        paymentReference: row.payment_reference,
+        subtotal: Number(row.subtotal),
+        total: Number(row.total),
+        couponCode: row.coupon_code,
+        items: row.items,
+        status: row.status,
+        paypalOrderId: row.paypal_order_id,
+        date: row.created_at instanceof Date
+            ? row.created_at.toISOString()
+            : String(row.created_at)
+    };
 }
 
-function addOrder(order) {
-    ordersDatabase.unshift(order);
-    saveOrdersToDisk();
+async function addOrder(order) {
+    if (!dbReady) {
+        console.warn('[DB] addOrder called but DB is not ready.');
+        return false;
+    }
+
+    try {
+        await db.query(
+            `INSERT INTO orders (
+                id, ign, discord_user, payment_method, payment_reference,
+                subtotal, total, coupon_code, items, status, paypal_order_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [
+                order.id,
+                order.ign,
+                order.discordUser,
+                order.paymentMethod,
+                order.paymentReference || null,
+                order.subtotal,
+                order.total,
+                order.couponCode || null,
+                JSON.stringify(order.items),
+                order.status,
+                order.paypalOrderId || null
+            ]
+        );
+        return true;
+    } catch (err) {
+        console.error('[DB] addOrder failed:', err.message);
+        return false;
+    }
 }
 
-function findOrderById(id) {
-    if (!id) return null;
-    const upper = String(id).toUpperCase();
-    return ordersDatabase.find(o => String(o.id).toUpperCase() === upper) || null;
+async function findOrderById(id) {
+    if (!dbReady || !id) return null;
+
+    try {
+        const result = await db.query(
+            `SELECT * FROM orders WHERE UPPER(id) = UPPER($1) LIMIT 1`,
+            [String(id)]
+        );
+
+        if (result.rows.length === 0) return null;
+        return rowToOrder(result.rows[0]);
+    } catch (err) {
+        console.error('[DB] findOrderById failed:', err.message);
+        return null;
+    }
 }
 
-function updateOrderStatus(id, status) {
-    const order = findOrderById(id);
-    if (!order) return false;
-    order.status = status;
-    saveOrdersToDisk();
-    return true;
+async function updateOrderStatus(id, status) {
+    if (!dbReady) return false;
+
+    try {
+        const result = await db.query(
+            `UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`,
+            [status, id]
+        );
+        return result.rowCount > 0;
+    } catch (err) {
+        console.error('[DB] updateOrderStatus failed:', err.message);
+        return false;
+    }
+}
+
+async function getStats() {
+    if (!dbReady) {
+        return { ok: false, error: 'DB not ready' };
+    }
+
+    try {
+        const totalResult = await db.query('SELECT COUNT(*)::int AS count FROM orders');
+        const statusResult = await db.query(
+            `SELECT status, COUNT(*)::int AS count FROM orders GROUP BY status`
+        );
+        const revenueResult = await db.query(
+            `SELECT COALESCE(SUM(total), 0)::numeric AS revenue
+             FROM orders WHERE status = 'مقبول'`
+        );
+        const recentResult = await db.query(
+            `SELECT * FROM orders ORDER BY created_at DESC LIMIT 10`
+        );
+
+        const byStatus = {};
+        statusResult.rows.forEach(r => {
+            byStatus[r.status] = r.count;
+        });
+
+        return {
+            ok: true,
+            totalOrders: totalResult.rows[0].count,
+            byStatus,
+            totalRevenue: Number(revenueResult.rows[0].revenue),
+            recentOrders: recentResult.rows.map(rowToOrder)
+        };
+    } catch (err) {
+        console.error('[DB] getStats failed:', err.message);
+        return { ok: false, error: err.message };
+    }
 }
 
 /* =========================================================
@@ -384,7 +516,6 @@ function generateInvoiceImage(order) {
         const rowHeight = 34;
         const itemsCount = order.items.length;
 
-        // Header + items + footer
         const headerHeight = 260;
         const itemsHeight = itemsCount * rowHeight + 80;
         const footerHeight = 180;
@@ -393,18 +524,15 @@ function generateInvoiceImage(order) {
         const canvas = createCanvas(width, height);
         const ctx = canvas.getContext('2d');
 
-        // Background
         const grad = ctx.createLinearGradient(0, 0, 0, height);
         grad.addColorStop(0, '#0b0f19');
         grad.addColorStop(1, '#131b2e');
         ctx.fillStyle = grad;
         ctx.fillRect(0, 0, width, height);
 
-        // Top border accent
         ctx.fillStyle = '#fbbf24';
         ctx.fillRect(0, 0, width, 6);
 
-        // Title
         ctx.fillStyle = '#fbbf24';
         ctx.font = 'bold 42px sans-serif';
         ctx.textAlign = 'center';
@@ -414,7 +542,6 @@ function generateInvoiceImage(order) {
         ctx.font = '20px sans-serif';
         ctx.fillText('PAYMENT INVOICE', width / 2, 115);
 
-        // Divider
         ctx.strokeStyle = '#3b3561';
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -422,7 +549,6 @@ function generateInvoiceImage(order) {
         ctx.lineTo(width - 60, 145);
         ctx.stroke();
 
-        // Order info
         ctx.textAlign = 'left';
         ctx.fillStyle = '#fef3c7';
         ctx.font = 'bold 22px sans-serif';
@@ -440,7 +566,6 @@ function generateInvoiceImage(order) {
         ctx.fillText(String(order.discordUser), 620, 190);
         ctx.fillText(String(order.paymentMethod), 620, 225);
 
-        // Date
         const dateStr = new Date(order.date).toLocaleString('en-US', {
             year: 'numeric', month: 'short', day: 'numeric',
             hour: '2-digit', minute: '2-digit'
@@ -450,7 +575,6 @@ function generateInvoiceImage(order) {
         ctx.font = '16px sans-serif';
         ctx.fillText(`Date: ${dateStr}`, 60, 265);
 
-        // Items header
         let y = 310;
         ctx.fillStyle = '#fbbf24';
         ctx.font = 'bold 20px sans-serif';
@@ -464,7 +588,6 @@ function generateInvoiceImage(order) {
 
         y += 50;
 
-        // Items list
         order.items.forEach((item, index) => {
             const title = item.title.length > 55
                 ? item.title.substring(0, 52) + '...'
@@ -486,7 +609,6 @@ function generateInvoiceImage(order) {
             y += rowHeight;
         });
 
-        // Subtotal + total
         y += 20;
         ctx.strokeStyle = '#fbbf24';
         ctx.lineWidth = 2;
@@ -526,7 +648,6 @@ function generateInvoiceImage(order) {
         ctx.font = 'bold 30px monospace';
         ctx.fillText(`$${Number(order.total).toFixed(2)} USD`, width - 75, y);
 
-        // Footer
         y += 60;
         ctx.strokeStyle = '#3b3561';
         ctx.lineWidth = 1;
@@ -546,7 +667,6 @@ function generateInvoiceImage(order) {
         ctx.font = 'bold 14px sans-serif';
         ctx.fillText('play.nashmimc.net  |  discord.gg/mB37jz6E7N', width / 2, y);
 
-        // Bottom accent
         ctx.fillStyle = '#fbbf24';
         ctx.fillRect(0, height - 6, width, 6);
 
@@ -626,7 +746,6 @@ async function sendPaymentProof(channel, imageProof) {
 async function createDiscordOrder(order, imageProof = null) {
     const channel = await fetchAdminChannel();
 
-    // USDT: send user-uploaded proof image if present
     if (imageProof) {
         try {
             await sendPaymentProof(channel, imageProof);
@@ -636,7 +755,6 @@ async function createDiscordOrder(order, imageProof = null) {
         }
     }
 
-    // Auto-invoice image for PayPal orders
     if (order.paymentMethod === 'PAYPAL' && !imageProof) {
         try {
             const invoiceBuffer = generateInvoiceImage(order);
@@ -783,15 +901,37 @@ function getCapturedAmount(paypalResponse) {
 /* =========================================================
    HEALTH
    ========================================================= */
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+    let dbStatus = 'disabled';
+    let dbOrders = null;
+
+    if (db) {
+        try {
+            const r = await db.query('SELECT COUNT(*)::int AS count FROM orders');
+            dbStatus = 'connected';
+            dbOrders = r.rows[0].count;
+        } catch (err) {
+            dbStatus = 'error: ' + err.message;
+        }
+    }
+
     res.json({
         ok: true,
         bot: client.isReady(),
         paypal: Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET),
         mode: PAYPAL_MODE,
         invoice: Boolean(createCanvas),
-        ordersCount: ordersDatabase.length
+        db: dbStatus,
+        ordersCount: dbOrders
     });
+});
+
+/* =========================================================
+   GET /api/stats (admin)
+   ========================================================= */
+app.get('/api/stats', trackingLimiter, async (req, res) => {
+    const stats = await getStats();
+    res.json(stats);
 });
 
 /* =========================================================
@@ -823,7 +963,6 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
         const cart = validateAndBuildCart(items);
         const total = calculateDiscountedTotal(cart.subtotal, couponCode);
         const orderId = createServerOrderId();
-        const now = new Date();
 
         const order = {
             id: orderId,
@@ -835,11 +974,11 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             total,
             couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null,
             items: cart.items,
-            date: now.toISOString(),
+            date: new Date().toISOString(),
             status: 'قيد الانتظار'
         };
 
-        addOrder(order);
+        await addOrder(order);
         await createDiscordOrder(order, imageProof);
 
         console.log(`[SUCCESS] Crypto order ${order.id}`);
@@ -974,9 +1113,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
             paypalOrderId
         };
 
-        addOrder(order);
-
-        // PayPal orders do NOT require user image — auto-invoice only
+        await addOrder(order);
         await createDiscordOrder(order, null);
 
         pendingPayPalOrders.delete(paypalOrderId);
@@ -1002,9 +1139,9 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
 /* =========================================================
    GET /api/orders/:orderId
    ========================================================= */
-app.get('/api/orders/:orderId', trackingLimiter, (req, res) => {
+app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
     const requestedId = normalizeText(req.params.orderId, 100).toUpperCase();
-    const order = findOrderById(requestedId);
+    const order = await findOrderById(requestedId);
 
     if (!order) {
         return res.status(404).json({ success: false, error: 'Order not found.' });
@@ -1034,17 +1171,17 @@ client.on('interactionCreate', async interaction => {
         const action = customId.substring(0, separatorIndex);
         const orderId = customId.substring(separatorIndex + 1);
 
-        const order = findOrderById(orderId);
+        const order = await findOrderById(orderId);
         if (!order) {
             await interaction.reply({
-                content: '⚠️ This order was not found in the current database.',
+                content: '⚠️ This order was not found in the database.',
                 ephemeral: true
             });
             return;
         }
 
         if (action === 'accept') {
-            updateOrderStatus(order.id, 'مقبول');
+            await updateOrderStatus(order.id, 'مقبول');
             await interaction.update({
                 content: interaction.message.content.replace(
                     '⏳ Pending',
@@ -1057,7 +1194,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'reject') {
-            updateOrderStatus(order.id, 'مرفوض');
+            await updateOrderStatus(order.id, 'مرفوض');
             await interaction.update({
                 content: interaction.message.content.replace(
                     '⏳ Pending',
@@ -1077,7 +1214,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log('========================================');
     console.log(`[BOT SUCCESS] Logged in as ${client.user.tag}!`);
     console.log(`[SERVER] Port: ${PORT}`);
@@ -1085,15 +1222,16 @@ client.once('ready', () => {
     console.log(`[PAYPAL] Mode: ${PAYPAL_MODE}`);
     console.log(`[PAYPAL] Configured: ${Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET)}`);
     console.log(`[INVOICE] Canvas: ${createCanvas ? 'OK' : 'DISABLED'}`);
-    console.log(`[STORE] Orders loaded: ${ordersDatabase.length}`);
+    console.log(`[DB] Configured: ${Boolean(DATABASE_URL)}`);
+
+    await initDatabase();
+
     console.log('========================================');
 });
 
 /* =========================================================
    BOOT
    ========================================================= */
-loadOrdersFromDisk();
-
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[SERVER] Express listening on 0.0.0.0:${PORT}`);
 });
@@ -1108,10 +1246,14 @@ client.login(process.env.DISCORD_TOKEN);
 /* =========================================================
    GRACEFUL SHUTDOWN
    ========================================================= */
-function shutdown(signal) {
+async function shutdown(signal) {
     console.log(`[SHUTDOWN] Received ${signal}. Cleaning up...`);
-    try { saveOrdersToDisk(); } catch (_) { /* ignore */ }
-    try { client.destroy(); } catch (_) { /* ignore */ }
+    try {
+        if (db) await db.end();
+    } catch (_) { /* ignore */ }
+    try {
+        client.destroy();
+    } catch (_) { /* ignore */ }
     process.exit(0);
 }
 
