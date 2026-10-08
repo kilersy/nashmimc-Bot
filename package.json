@@ -1,6 +1,6 @@
 {
   "name": "nashmi-store-bot",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,7 +9,8 @@
     "@napi-rs/canvas": "^0.1.65",
     "discord.js": "^14.27.0",
     "express": "^5.2.1",
-    "express-rate-limit": "^7.5.0"
+    "express-rate-limit": "^7.5.0",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">=18.0.0"
