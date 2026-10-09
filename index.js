@@ -1,10 +1,13 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v6
-   Fixes:
-   - getStats consistency (single query)
-   - Auto-normalize legacy Arabic statuses
-   - Reset button on admin dashboard
-   - Accept/Reject/Reset in admin
+   NashmiMC Store Bot — Production Build v7
+   Features:
+   - Bi-directional sync: Admin Panel ↔ Discord
+   - Accept / Reject / Reset buttons in Discord (English)
+   - Timestamps in Discord order messages
+   - PostgreSQL persistence (with message IDs)
+   - Auto-invoice PNG for PayPal
+   - USDT payment proof images
+   - Rate limiting + strict validation + XSS sanitization
    ========================================================= */
 
 'use strict';
@@ -139,10 +142,16 @@ async function initDatabase() {
                 items             JSONB NOT NULL,
                 status            VARCHAR(32) NOT NULL DEFAULT 'pending',
                 paypal_order_id   VARCHAR(128),
+                discord_message_id VARCHAR(64),
+                discord_channel_id VARCHAR(64),
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
+
+        // Idempotent ALTERs for existing tables
+        await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_message_id VARCHAR(64)`);
+        await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_channel_id VARCHAR(64)`);
 
         await db.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status)`);
         await db.query(`CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC)`);
@@ -172,6 +181,8 @@ function rowToOrder(row) {
         items: row.items,
         status: row.status,
         paypalOrderId: row.paypal_order_id,
+        discordMessageId: row.discord_message_id,
+        discordChannelId: row.discord_channel_id,
         date: row.created_at instanceof Date
             ? row.created_at.toISOString()
             : String(row.created_at)
@@ -243,18 +254,31 @@ async function updateOrderStatus(id, status) {
     }
 }
 
+async function saveDiscordMessageIds(orderId, messageId, channelId) {
+    if (!dbReady) return false;
+
+    try {
+        await db.query(
+            `UPDATE orders SET discord_message_id = $1, discord_channel_id = $2 WHERE id = $3`,
+            [messageId, channelId, orderId]
+        );
+        return true;
+    } catch (err) {
+        console.error('[DB] saveDiscordMessageIds failed:', err.message);
+        return false;
+    }
+}
+
 async function getStats() {
     if (!dbReady) {
         return { ok: false, error: 'DB not ready' };
     }
 
     try {
-        // Auto-normalize any legacy Arabic statuses
         await db.query(`UPDATE orders SET status = 'pending'  WHERE status IN ('قيد الانتظار', 'pending')`);
         await db.query(`UPDATE orders SET status = 'approved' WHERE status IN ('مقبول', 'approved')`);
         await db.query(`UPDATE orders SET status = 'rejected' WHERE status IN ('مرفوض', 'rejected')`);
 
-        // Single query for consistent counters
         const countersResult = await db.query(`
             SELECT
               COUNT(*)::int AS total,
@@ -393,6 +417,15 @@ function sanitizeForDiscord(value, maxLength = 300) {
     s = s.replace(/@(everyone|here|&)/g, '@\u200b$1');
     s = s.replace(/[\r\n]+/g, ' ');
     return s.substring(0, maxLength);
+}
+
+function formatDiscordTimestamp(isoString) {
+    try {
+        const unix = Math.floor(new Date(isoString).getTime() / 1000);
+        return `<t:${unix}:F>`; // Full date/time (localized)
+    } catch (_) {
+        return 'Unknown';
+    }
 }
 
 /* =========================================================
@@ -718,6 +751,7 @@ function buildOrderMessage(order) {
     const safeDiscord = sanitizeForDiscord(order.discordUser, 64);
     const safeMethod = sanitizeForDiscord(order.paymentMethod, 32);
     const safeRef = sanitizeForDiscord(order.paymentReference || 'N/A', 200);
+    const timestamp = formatDiscordTimestamp(order.date);
 
     return (
         `🛒 **New Order from Nashmi Store!**\n` +
@@ -726,6 +760,7 @@ function buildOrderMessage(order) {
         `- **Discord:** \`${safeDiscord}\`\n` +
         `- **Payment Method:** ${safeMethod}\n` +
         `- **Total:** $${Number(order.total).toFixed(2)}\n` +
+        `- **Date:** ${timestamp}\n` +
         `- **Status:** ⏳ Pending\n` +
         `- **Reference:** ${safeRef}\n\n` +
         `**Items:**\n${itemsList}`
@@ -761,6 +796,38 @@ async function sendPaymentProof(channel, imageProof) {
     return true;
 }
 
+function buildActionButtons(orderId, includeAll) {
+    const row = new ActionRowBuilder();
+
+    row.addComponents(
+        new ButtonBuilder()
+            .setCustomId(`accept_${orderId}`)
+            .setLabel('Accept')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('✅')
+    );
+
+    row.addComponents(
+        new ButtonBuilder()
+            .setCustomId(`reject_${orderId}`)
+            .setLabel('Reject')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('❌')
+    );
+
+    if (includeAll) {
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`reset_${orderId}`)
+                .setLabel('Reset')
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji('🔄')
+        );
+    }
+
+    return row;
+}
+
 async function createDiscordOrder(order, imageProof = null) {
     const channel = await fetchAdminChannel();
 
@@ -792,24 +859,72 @@ async function createDiscordOrder(order, imageProof = null) {
         }
     }
 
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`accept_${order.id}`)
-            .setLabel('✅ قبول')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId(`reject_${order.id}`)
-            .setLabel('❌ رفض')
-            .setStyle(ButtonStyle.Danger)
-    );
+    const row = buildActionButtons(order.id, true);
 
-    await channel.send({
+    const sentMessage = await channel.send({
         content: buildOrderMessage(order),
         components: [row],
         allowedMentions: { parse: [] }
     });
 
-    console.log(`[DISCORD] Order ${order.id} posted.`);
+    // Save Discord message IDs for future syncs
+    await saveDiscordMessageIds(order.id, sentMessage.id, sentMessage.channel.id);
+
+    console.log(`[DISCORD] Order ${order.id} posted (message ${sentMessage.id}).`);
+}
+
+async function syncDiscordMessage(orderId, newStatus, actorName) {
+    const order = await findOrderById(orderId);
+    if (!order) return;
+
+    if (!order.discordMessageId || !order.discordChannelId) {
+        console.log(`[SYNC] Skipping Discord sync for ${orderId} (no message info).`);
+        return;
+    }
+
+    try {
+        const channel = await client.channels.fetch(order.discordChannelId);
+        if (!channel || !channel.isTextBased()) return;
+
+        const message = await channel.messages.fetch(order.discordMessageId);
+        if (!message) return;
+
+        let statusEmoji = '⏳';
+        let statusText = 'Pending';
+
+        if (newStatus === 'approved') {
+            statusEmoji = '✅';
+            statusText = 'Approved';
+        } else if (newStatus === 'rejected') {
+            statusEmoji = '❌';
+            statusText = 'Rejected';
+        }
+
+        const actorSuffix = actorName ? ` (by ${actorName})` : '';
+        const newStatusLine = `- **Status:** ${statusEmoji} **${statusText}**${actorSuffix}`;
+
+        const statusLineRegex = /- \*\*Status:\*\* .*/;
+        let newContent = message.content;
+
+        if (statusLineRegex.test(newContent)) {
+            newContent = newContent.replace(statusLineRegex, newStatusLine);
+        } else {
+            newContent += `\n${newStatusLine}`;
+        }
+
+        const components = newStatus === 'pending'
+            ? [buildActionButtons(orderId, true)]
+            : [];
+
+        await message.edit({
+            content: newContent,
+            components
+        });
+
+        console.log(`[SYNC] Discord message updated for ${orderId} → ${newStatus}`);
+    } catch (error) {
+        console.error(`[SYNC] Failed to update Discord message for ${orderId}:`, error.message);
+    }
 }
 
 /* =========================================================
@@ -1244,7 +1359,10 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
             return res.status(500).json({ success: false, error: 'Failed to update order status.' });
         }
 
-        console.log('[ADMIN] Order ' + order.id + ' → ' + newStatus);
+        // Sync to Discord
+        await syncDiscordMessage(order.id, newStatus, 'Admin Panel');
+
+        console.log(`[ADMIN] Order ${order.id} → ${newStatus}`);
 
         return res.json({ success: true, orderId: order.id, status: newStatus });
     } catch (error) {
@@ -1527,7 +1645,7 @@ app.get('/admin', adminAuth, (req, res) => {
 const pendingPayPalOrders = new Map();
 
 /* =========================================================
-   DISCORD INTERACTIONS
+   DISCORD INTERACTIONS — Accept / Reject / Reset
    ========================================================= */
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
@@ -1549,25 +1667,51 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
+        let newStatus;
+
         if (action === 'accept') {
-            await updateOrderStatus(order.id, 'approved');
-            await interaction.update({
-                content: interaction.message.content.replace('⏳ Pending', `✅ **Accepted** (by ${interaction.user.tag})`),
-                components: []
-            });
-            console.log(`[ORDER] ${order.id} accepted by ${interaction.user.tag}`);
+            newStatus = 'approved';
+        } else if (action === 'reject') {
+            newStatus = 'rejected';
+        } else if (action === 'reset') {
+            newStatus = 'pending';
+        } else {
             return;
         }
 
-        if (action === 'reject') {
-            await updateOrderStatus(order.id, 'rejected');
-            await interaction.update({
-                content: interaction.message.content.replace('⏳ Pending', `❌ **Rejected** (by ${interaction.user.tag})`),
-                components: []
-            });
-            console.log(`[ORDER] ${order.id} rejected by ${interaction.user.tag}`);
-            return;
+        await updateOrderStatus(order.id, newStatus);
+
+        // Update inline message
+        let statusEmoji = '⏳';
+        let statusText = 'Pending';
+
+        if (newStatus === 'approved') {
+            statusEmoji = '✅';
+            statusText = 'Approved';
+        } else if (newStatus === 'rejected') {
+            statusEmoji = '❌';
+            statusText = 'Rejected';
         }
+
+        const newStatusLine = `- **Status:** ${statusEmoji} **${statusText}** (by ${interaction.user.tag})`;
+
+        const statusLineRegex = /- \*\*Status:\*\* .*/;
+        let newContent = interaction.message.content;
+
+        if (statusLineRegex.test(newContent)) {
+            newContent = newContent.replace(statusLineRegex, newStatusLine);
+        }
+
+        const components = newStatus === 'pending'
+            ? [buildActionButtons(order.id, true)]
+            : [];
+
+        await interaction.update({
+            content: newContent,
+            components
+        });
+
+        console.log(`[DISCORD] Order ${order.id} → ${newStatus} by ${interaction.user.tag}`);
     } catch (error) {
         console.error('[DISCORD] Interaction error:', error);
         if (interaction.replied || interaction.deferred) return;
