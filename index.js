@@ -1,13 +1,8 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v7
-   Features:
-   - Bi-directional sync: Admin Panel ↔ Discord
-   - Accept / Reject / Reset buttons in Discord (English)
-   - Timestamps in Discord order messages
-   - PostgreSQL persistence (with message IDs)
-   - Auto-invoice PNG for PayPal
-   - USDT payment proof images
-   - Rate limiting + strict validation + XSS sanitization
+   NashmiMC Store Bot — Production Build v8
+   Changes from v7:
+   - Reset button persists after Accept/Reject (never removed)
+   - Custom Confirm Dialog in Admin Panel (styled, not browser default)
    ========================================================= */
 
 'use strict';
@@ -149,7 +144,6 @@ async function initDatabase() {
             )
         `);
 
-        // Idempotent ALTERs for existing tables
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_message_id VARCHAR(64)`);
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_channel_id VARCHAR(64)`);
 
@@ -422,7 +416,7 @@ function sanitizeForDiscord(value, maxLength = 300) {
 function formatDiscordTimestamp(isoString) {
     try {
         const unix = Math.floor(new Date(isoString).getTime() / 1000);
-        return `<t:${unix}:F>`; // Full date/time (localized)
+        return `<t:${unix}:F>`;
     } catch (_) {
         return 'Unknown';
     }
@@ -796,7 +790,7 @@ async function sendPaymentProof(channel, imageProof) {
     return true;
 }
 
-function buildActionButtons(orderId, includeAll) {
+function buildActionButtons(orderId) {
     const row = new ActionRowBuilder();
 
     row.addComponents(
@@ -815,15 +809,13 @@ function buildActionButtons(orderId, includeAll) {
             .setEmoji('❌')
     );
 
-    if (includeAll) {
-        row.addComponents(
-            new ButtonBuilder()
-                .setCustomId(`reset_${orderId}`)
-                .setLabel('Reset')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('🔄')
-        );
-    }
+    row.addComponents(
+        new ButtonBuilder()
+            .setCustomId(`reset_${orderId}`)
+            .setLabel('Reset')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🔄')
+    );
 
     return row;
 }
@@ -859,7 +851,7 @@ async function createDiscordOrder(order, imageProof = null) {
         }
     }
 
-    const row = buildActionButtons(order.id, true);
+    const row = buildActionButtons(order.id);
 
     const sentMessage = await channel.send({
         content: buildOrderMessage(order),
@@ -867,7 +859,6 @@ async function createDiscordOrder(order, imageProof = null) {
         allowedMentions: { parse: [] }
     });
 
-    // Save Discord message IDs for future syncs
     await saveDiscordMessageIds(order.id, sentMessage.id, sentMessage.channel.id);
 
     console.log(`[DISCORD] Order ${order.id} posted (message ${sentMessage.id}).`);
@@ -912,9 +903,8 @@ async function syncDiscordMessage(orderId, newStatus, actorName) {
             newContent += `\n${newStatusLine}`;
         }
 
-        const components = newStatus === 'pending'
-            ? [buildActionButtons(orderId, true)]
-            : [];
+        // Buttons are ALWAYS kept — never removed.
+        const components = [buildActionButtons(orderId)];
 
         await message.edit({
             content: newContent,
@@ -1359,7 +1349,6 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
             return res.status(500).json({ success: false, error: 'Failed to update order status.' });
         }
 
-        // Sync to Discord
         await syncDiscordMessage(order.id, newStatus, 'Admin Panel');
 
         console.log(`[ADMIN] Order ${order.id} → ${newStatus}`);
@@ -1437,6 +1426,83 @@ const ADMIN_HTML = `<!DOCTYPE html>
   .toast.show { transform:translateY(0); opacity:1; }
   .toast.success { border-color:var(--success); }
   .toast.error { border-color:var(--danger); }
+
+  /* ========== Confirm Modal ========== */
+  .confirm-overlay {
+    position:fixed; top:0; left:0; width:100%; height:100%;
+    background:rgba(0,0,0,0.75);
+    backdrop-filter:blur(6px);
+    display:none; justify-content:center; align-items:center;
+    z-index:10000; padding:20px;
+  }
+  .confirm-overlay.open { display:flex; }
+  .confirm-modal {
+    background:var(--card);
+    border:2px solid var(--accent);
+    border-radius:18px;
+    padding:32px 28px;
+    width:100%; max-width:480px;
+    box-shadow:0 20px 60px rgba(0,0,0,0.6);
+    text-align:center;
+    animation: popIn 0.25s ease;
+  }
+  @keyframes popIn {
+    from { opacity:0; transform:scale(0.9); }
+    to { opacity:1; transform:scale(1); }
+  }
+  .confirm-icon {
+    font-size:3rem;
+    margin-bottom:15px;
+    display:block;
+  }
+  .confirm-title {
+    font-size:1.4rem;
+    font-weight:800;
+    color:var(--text);
+    margin-bottom:10px;
+  }
+  .confirm-message {
+    color:var(--muted);
+    font-size:0.95rem;
+    line-height:1.6;
+    margin-bottom:25px;
+  }
+  .confirm-message strong { color:var(--accent); }
+  .confirm-actions {
+    display:flex;
+    gap:12px;
+    justify-content:center;
+  }
+  .btn-confirm-cancel, .btn-confirm-ok {
+    padding:12px 26px;
+    border:none;
+    border-radius:10px;
+    font-weight:800;
+    font-size:0.95rem;
+    cursor:pointer;
+    transition:all 0.2s;
+    font-family:inherit;
+    min-width:120px;
+  }
+  .btn-confirm-cancel {
+    background:transparent;
+    border:2px solid var(--border);
+    color:var(--text);
+  }
+  .btn-confirm-cancel:hover {
+    background:var(--card-hover);
+    border-color:var(--muted);
+  }
+  .btn-confirm-ok {
+    color:#fff;
+  }
+  .btn-confirm-ok.accept { background:var(--success); }
+  .btn-confirm-ok.accept:hover { background:#059669; }
+  .btn-confirm-ok.reject { background:var(--danger); }
+  .btn-confirm-ok.reject:hover { background:#b91c1c; }
+  .btn-confirm-ok.reset { background:#6366f1; }
+  .btn-confirm-ok.reset:hover { background:#4f46e5; }
+
   @media (max-width:900px) { table { font-size:0.8rem; } th, td { padding:10px 12px; } h1 { font-size:1.4rem; } h1 span { display:block; margin-left:0; margin-top:4px; } }
 </style>
 </head>
@@ -1489,11 +1555,25 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
 <div class="toast" id="toast"></div>
 
+<!-- Confirm Modal -->
+<div class="confirm-overlay" id="confirmOverlay">
+  <div class="confirm-modal">
+    <span class="confirm-icon" id="confirmIcon">⚠️</span>
+    <div class="confirm-title" id="confirmTitle">Are you sure?</div>
+    <div class="confirm-message" id="confirmMessage">Please confirm this action.</div>
+    <div class="confirm-actions">
+      <button class="btn-confirm-cancel" id="confirmCancelBtn">Cancel</button>
+      <button class="btn-confirm-ok" id="confirmOkBtn">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <script>
 var refreshTimer = null;
 var countdownTimer = null;
 var secondsLeft = 15;
 var allOrders = [];
+var pendingConfirm = null;
 
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
@@ -1562,7 +1642,6 @@ function renderOrders() {
     var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
     var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
     var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
-    var isPending = (o.status === 'pending' || o.status === 'قيد الانتظار');
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
       '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
@@ -1573,8 +1652,8 @@ function renderOrders() {
       '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
       '<td>' + escapeHtml(dateStr) + '</td>' +
       '<td><div class="actions-cell">' +
-        '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Accept</button>' +
-        '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Reject</button>' +
+        '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '">Accept</button>' +
+        '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '">Reject</button>' +
         '<button class="btn-action btn-reset" data-action="reset" data-id="' + escapeHtml(o.id) + '">Reset</button>' +
       '</div></td>' +
     '</tr>';
@@ -1583,13 +1662,59 @@ function renderOrders() {
   var buttons = tbody.querySelectorAll('[data-action]');
   for (var i = 0; i < buttons.length; i++) {
     buttons[i].addEventListener('click', function () {
-      updateOrder(this.dataset.id, this.dataset.action);
+      askConfirm(this.dataset.id, this.dataset.action);
     });
   }
 }
 
-function updateOrder(orderId, action) {
-  if (!confirm('Are you sure you want to ' + action + ' order ' + orderId + '?')) return;
+/* ====== Confirm Dialog ====== */
+function askConfirm(orderId, action) {
+  var icon = '⚠️';
+  var title = 'Are you sure?';
+  var message = '';
+  var btnLabel = 'Confirm';
+
+  if (action === 'accept') {
+    icon = '✅';
+    title = 'Accept this order?';
+    message = 'You are about to <strong>Accept</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Approved.';
+    btnLabel = 'Accept';
+  } else if (action === 'reject') {
+    icon = '❌';
+    title = 'Reject this order?';
+    message = 'You are about to <strong>Reject</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Rejected.';
+    btnLabel = 'Reject';
+  } else if (action === 'reset') {
+    icon = '🔄';
+    title = 'Reset this order?';
+    message = 'You are about to <strong>Reset</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will set it back to Pending.';
+    btnLabel = 'Reset';
+  }
+
+  document.getElementById('confirmIcon').textContent = icon;
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMessage').innerHTML = message;
+
+  var okBtn = document.getElementById('confirmOkBtn');
+  okBtn.textContent = btnLabel;
+  okBtn.className = 'btn-confirm-ok ' + action;
+
+  pendingConfirm = { orderId: orderId, action: action };
+
+  document.getElementById('confirmOverlay').classList.add('open');
+}
+
+function closeConfirm() {
+  document.getElementById('confirmOverlay').classList.remove('open');
+  pendingConfirm = null;
+}
+
+function executeConfirm() {
+  if (!pendingConfirm) return;
+  var orderId = pendingConfirm.orderId;
+  var action = pendingConfirm.action;
+  closeConfirm();
+
   fetch('/api/admin/update-order', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1598,12 +1723,25 @@ function updateOrder(orderId, action) {
     .then(function (r) { return r.json(); })
     .then(function (data) {
       if (!data.success) throw new Error(data.error || 'Failed');
-      showToast('Order ' + orderId + ' ' + action + 'ed successfully.', 'success');
+      var verb = action === 'accept' ? 'accepted' : action === 'reject' ? 'rejected' : 'reset';
+      showToast('Order ' + orderId + ' ' + verb + ' successfully.', 'success');
       loadStats();
     })
     .catch(function (err) { console.error(err); showToast('Failed: ' + err.message, 'error'); });
 }
 
+document.getElementById('confirmOkBtn').addEventListener('click', executeConfirm);
+document.getElementById('confirmCancelBtn').addEventListener('click', closeConfirm);
+
+document.getElementById('confirmOverlay').addEventListener('click', function (e) {
+  if (e.target === this) closeConfirm();
+});
+
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') closeConfirm();
+});
+
+/* ====== Timers ====== */
 function resetTimers() {
   clearInterval(refreshTimer);
   clearInterval(countdownTimer);
@@ -1645,7 +1783,7 @@ app.get('/admin', adminAuth, (req, res) => {
 const pendingPayPalOrders = new Map();
 
 /* =========================================================
-   DISCORD INTERACTIONS — Accept / Reject / Reset
+   DISCORD INTERACTIONS — Accept / Reject / Reset (persistent buttons)
    ========================================================= */
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
@@ -1681,7 +1819,6 @@ client.on('interactionCreate', async interaction => {
 
         await updateOrderStatus(order.id, newStatus);
 
-        // Update inline message
         let statusEmoji = '⏳';
         let statusText = 'Pending';
 
@@ -1702,9 +1839,8 @@ client.on('interactionCreate', async interaction => {
             newContent = newContent.replace(statusLineRegex, newStatusLine);
         }
 
-        const components = newStatus === 'pending'
-            ? [buildActionButtons(order.id, true)]
-            : [];
+        // Buttons are ALWAYS kept — never removed.
+        const components = [buildActionButtons(order.id)];
 
         await interaction.update({
             content: newContent,
