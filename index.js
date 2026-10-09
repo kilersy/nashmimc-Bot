@@ -1,9 +1,14 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v4
-   - PostgreSQL persistence (replaces JSON file)
-   - Auto-invoice image for PayPal
-   - USDT payment proof images
-   - Full sanitization + rate limiting
+   NashmiMC Store Bot — Production Build v5
+   Features:
+   - Discord bot with order notifications
+   - PayPal integration (auto-capture verification)
+   - USDT TRC20 manual payment with proof images
+   - Auto-generated PNG invoice images
+   - PostgreSQL persistence
+   - Rate limiting + strict input validation
+   - XSS sanitization
+   - Admin dashboard with Accept/Reject
    ========================================================= */
 
 'use strict';
@@ -36,6 +41,7 @@ const app = express();
    ========================================================= */
 const PORT = Number(process.env.PORT) || 10000;
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID || '1551626123585130546';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
@@ -135,7 +141,7 @@ async function initDatabase() {
                 total             NUMERIC(10, 2) NOT NULL,
                 coupon_code       VARCHAR(32),
                 items             JSONB NOT NULL,
-                status            VARCHAR(32) NOT NULL DEFAULT 'قيد الانتظار',
+                status            VARCHAR(32) NOT NULL DEFAULT 'pending',
                 paypal_order_id   VARCHAR(128),
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -253,10 +259,10 @@ async function getStats() {
         );
         const revenueResult = await db.query(
             `SELECT COALESCE(SUM(total), 0)::numeric AS revenue
-             FROM orders WHERE status = 'مقبول'`
+             FROM orders WHERE status = 'approved' OR status = 'مقبول'`
         );
         const recentResult = await db.query(
-            `SELECT * FROM orders ORDER BY created_at DESC LIMIT 10`
+            `SELECT * FROM orders ORDER BY created_at DESC LIMIT 100`
         );
 
         const byStatus = {};
@@ -311,7 +317,7 @@ const globalLimiter = rateLimit({
 
 const orderLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 5,
+    max: 30,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many order attempts. Please wait a minute.' }
@@ -319,7 +325,7 @@ const orderLimiter = rateLimit({
 
 const trackingLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 30,
+    max: 60,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many tracking requests.' }
@@ -899,6 +905,32 @@ function getCapturedAmount(paypalResponse) {
 }
 
 /* =========================================================
+   ADMIN AUTH MIDDLEWARE
+   ========================================================= */
+function adminAuth(req, res, next) {
+    if (!ADMIN_PASSWORD) {
+        return res.status(503).send('Admin password not configured. Set ADMIN_PASSWORD env var on Render.');
+    }
+
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Basic ')) {
+        res.set('WWW-Authenticate', 'Basic realm="NashmiMC Admin"');
+        return res.status(401).send('Authentication required.');
+    }
+
+    const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+    const separatorIdx = decoded.indexOf(':');
+    const password = separatorIdx >= 0 ? decoded.substring(separatorIdx + 1) : decoded;
+
+    if (password !== ADMIN_PASSWORD) {
+        res.set('WWW-Authenticate', 'Basic realm="NashmiMC Admin"');
+        return res.status(401).send('Invalid credentials.');
+    }
+
+    next();
+}
+
+/* =========================================================
    HEALTH
    ========================================================= */
 app.get('/health', async (req, res) => {
@@ -921,13 +953,14 @@ app.get('/health', async (req, res) => {
         paypal: Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET),
         mode: PAYPAL_MODE,
         invoice: Boolean(createCanvas),
+        admin: Boolean(ADMIN_PASSWORD),
         db: dbStatus,
         ordersCount: dbOrders
     });
 });
 
 /* =========================================================
-   GET /api/stats (admin)
+   STATS API
    ========================================================= */
 app.get('/api/stats', trackingLimiter, async (req, res) => {
     const stats = await getStats();
@@ -975,7 +1008,7 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null,
             items: cart.items,
             date: new Date().toISOString(),
-            status: 'قيد الانتظار'
+            status: 'pending'
         };
 
         await addOrder(order);
@@ -1109,7 +1142,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
             couponCode: pending.couponCode,
             items: pending.items,
             date: new Date().toISOString(),
-            status: 'قيد الانتظار',
+            status: 'pending',
             paypalOrderId
         };
 
@@ -1158,6 +1191,454 @@ app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
 });
 
 /* =========================================================
+   POST /api/admin/update-order
+   ========================================================= */
+app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) => {
+    try {
+        const { orderId, action } = req.body || {};
+
+        if (typeof orderId !== 'string' || !orderId.trim()) {
+            return res.status(400).json({ success: false, error: 'orderId is required.' });
+        }
+
+        if (action !== 'accept' && action !== 'reject') {
+            return res.status(400).json({ success: false, error: 'action must be accept or reject.' });
+        }
+
+        const order = await findOrderById(orderId);
+        if (!order) {
+            return res.status(404).json({ success: false, error: 'Order not found.' });
+        }
+
+        const newStatus = action === 'accept' ? 'approved' : 'rejected';
+        const updated = await updateOrderStatus(order.id, newStatus);
+
+        if (!updated) {
+            return res.status(500).json({ success: false, error: 'Failed to update order status.' });
+        }
+
+        console.log('[ADMIN] Order ' + order.id + ' ' + action + 'ed.');
+
+        return res.json({ success: true, orderId: order.id, status: newStatus });
+    } catch (error) {
+        console.error('[ADMIN] update-order failed:', error);
+        return res.status(500).json({ success: false, error: error.message || 'Internal error.' });
+    }
+});
+
+/* =========================================================
+   GET /admin — Dashboard
+   ========================================================= */
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NashmiMC Admin — Orders</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --card: #131b2e;
+    --card-hover: #1a2340;
+    --border: #2d3654;
+    --accent: #fbbf24;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --success: #10b981;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px;
+  }
+  .container { max-width: 1500px; margin: 0 auto; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 0;
+    border-bottom: 2px solid var(--border);
+    margin-bottom: 30px;
+    flex-wrap: wrap;
+    gap: 15px;
+  }
+  h1 { font-size: 1.8rem; color: var(--accent); font-weight: 800; letter-spacing: -0.5px; }
+  h1 span { color: var(--text); font-weight: 400; font-size: 0.95rem; margin-left: 12px; }
+  .refresh-info { font-size: 0.85rem; color: var(--muted); }
+  .refresh-info strong { color: var(--accent); }
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 15px;
+    margin-bottom: 30px;
+  }
+  .stat-card {
+    background: var(--card);
+    border: 2px solid var(--border);
+    border-radius: 14px;
+    padding: 22px;
+    transition: all 0.2s;
+  }
+  .stat-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .stat-label {
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .stat-value { font-size: 2.2rem; font-weight: 800; color: var(--accent); }
+  .stat-value.green { color: var(--success); }
+  .stat-value.red { color: var(--danger); }
+  .stat-value.yellow { color: var(--warning); }
+  .search-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+  .search-bar input, .search-bar select {
+    background: var(--card);
+    border: 2px solid var(--border);
+    color: var(--text);
+    padding: 12px 16px;
+    border-radius: 10px;
+    font-size: 0.95rem;
+    outline: none;
+    font-family: inherit;
+  }
+  .search-bar input { flex: 1; min-width: 200px; }
+  .search-bar input:focus, .search-bar select:focus { border-color: var(--accent); }
+  .search-bar button {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 12px 22px;
+    border-radius: 10px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .search-bar button:hover { transform: scale(1.03); }
+  .orders-table-wrapper {
+    background: var(--card);
+    border: 2px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  thead { background: #0f1524; border-bottom: 2px solid var(--border); }
+  th {
+    text-align: left;
+    padding: 14px 16px;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  td { padding: 14px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tbody tr:hover { background: var(--card-hover); }
+  tbody tr:last-child td { border-bottom: none; }
+  .order-id { font-family: monospace; color: var(--accent); font-weight: 600; font-size: 0.85rem; }
+  .ign { font-weight: 600; }
+  .discord { color: var(--muted); font-size: 0.85rem; }
+  .method-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+  }
+  .method-paypal { background: #003087; color: #fff; }
+  .method-crypto { background: #26a17b; color: #fff; }
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-weight: 700;
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+  .status-pending { background: rgba(245, 158, 11, 0.2); color: var(--warning); border: 1px solid var(--warning); }
+  .status-approved { background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); }
+  .status-rejected { background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid var(--danger); }
+  .total-cell { font-weight: 800; color: var(--accent); font-family: monospace; font-size: 1rem; }
+  .actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+  .btn-action {
+    border: none;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .btn-accept { background: var(--success); color: #fff; }
+  .btn-accept:hover:not(:disabled) { background: #059669; }
+  .btn-reject { background: var(--danger); color: #fff; }
+  .btn-reject:hover:not(:disabled) { background: #b91c1c; }
+  .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--muted); }
+  .toast {
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    background: var(--card);
+    border: 2px solid var(--accent);
+    border-radius: 12px;
+    padding: 16px 22px;
+    font-weight: 600;
+    color: var(--text);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s;
+    z-index: 9999;
+    max-width: 350px;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.success { border-color: var(--success); }
+  .toast.error { border-color: var(--danger); }
+  @media (max-width: 900px) {
+    table { font-size: 0.8rem; }
+    th, td { padding: 10px 12px; }
+    h1 { font-size: 1.4rem; }
+    h1 span { display: block; margin-left: 0; margin-top: 4px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>NashmiMC Admin <span>— Order Management</span></h1>
+    <div class="refresh-info">Auto-refresh in <strong id="countdown">15</strong>s</div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">Total Orders</div><div class="stat-value" id="statTotal">—</div></div>
+    <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-value yellow" id="statPending">—</div></div>
+    <div class="stat-card"><div class="stat-label">Approved</div><div class="stat-value green" id="statApproved">—</div></div>
+    <div class="stat-card"><div class="stat-label">Rejected</div><div class="stat-value red" id="statRejected">—</div></div>
+    <div class="stat-card"><div class="stat-label">Revenue (Approved)</div><div class="stat-value green" id="statRevenue">—</div></div>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="Search by Order ID, IGN, or Discord...">
+    <select id="filterStatus">
+      <option value="">All Statuses</option>
+      <option value="pending">Pending</option>
+      <option value="approved">Approved</option>
+      <option value="rejected">Rejected</option>
+    </select>
+    <button id="refreshBtn">Refresh Now</button>
+  </div>
+
+  <div class="orders-table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>Order ID</th>
+          <th>Player</th>
+          <th>Method</th>
+          <th>Items</th>
+          <th>Total</th>
+          <th>Status</th>
+          <th>Date</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ordersTbody">
+        <tr><td colspan="8" class="empty-state">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var refreshTimer = null;
+var countdownTimer = null;
+var secondsLeft = 15;
+var allOrders = [];
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function showToast(message, type) {
+  var t = document.getElementById('toast');
+  t.textContent = message;
+  t.className = 'toast show ' + (type || '');
+  setTimeout(function () { t.className = 'toast'; }, 3000);
+}
+
+function statusInfo(status) {
+  if (status === 'approved' || status === 'مقبول') return { cls: 'status-approved', icon: '\\u2713', label: 'Approved' };
+  if (status === 'rejected' || status === 'مرفوض') return { cls: 'status-rejected', icon: '\\u2715', label: 'Rejected' };
+  return { cls: 'status-pending', icon: '\\u23F1', label: 'Pending' };
+}
+
+function loadStats() {
+  fetch('/api/stats')
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (!data.ok) throw new Error(data.error || 'Failed');
+
+      document.getElementById('statTotal').textContent = data.totalOrders || 0;
+      var byStatus = data.byStatus || {};
+      document.getElementById('statPending').textContent = (byStatus['pending'] || 0) + (byStatus['قيد الانتظار'] || 0);
+      document.getElementById('statApproved').textContent = (byStatus['approved'] || 0) + (byStatus['مقبول'] || 0);
+      document.getElementById('statRejected').textContent = (byStatus['rejected'] || 0) + (byStatus['مرفوض'] || 0);
+      document.getElementById('statRevenue').textContent = '$' + Number(data.totalRevenue || 0).toFixed(2);
+
+      allOrders = data.recentOrders || [];
+      renderOrders();
+    })
+    .catch(function (err) {
+      console.error(err);
+      showToast('Failed to load orders', 'error');
+    });
+}
+
+function renderOrders() {
+  var tbody = document.getElementById('ordersTbody');
+  var search = document.getElementById('searchInput').value.trim().toLowerCase();
+  var filterStatus = document.getElementById('filterStatus').value;
+
+  var filtered = allOrders;
+
+  if (search) {
+    filtered = filtered.filter(function (o) {
+      return String(o.id || '').toLowerCase().indexOf(search) !== -1 ||
+             String(o.ign || '').toLowerCase().indexOf(search) !== -1 ||
+             String(o.discordUser || '').toLowerCase().indexOf(search) !== -1;
+    });
+  }
+
+  if (filterStatus) {
+    filtered = filtered.filter(function (o) {
+      if (filterStatus === 'pending') return o.status === 'pending' || o.status === 'قيد الانتظار';
+      if (filterStatus === 'approved') return o.status === 'approved' || o.status === 'مقبول';
+      if (filterStatus === 'rejected') return o.status === 'rejected' || o.status === 'مرفوض';
+      return true;
+    });
+  }
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No orders match your filters.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(function (o) {
+    var si = statusInfo(o.status);
+    var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
+    var itemsStr = Array.isArray(o.items)
+      ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>')
+      : '—';
+    var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
+    var isPending = (o.status === 'pending' || o.status === 'قيد الانتظار');
+
+    return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
+      '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
+      '<td><div class="ign">' + escapeHtml(o.ign || '—') + '</div>' +
+      '<div class="discord">' + escapeHtml(o.discordUser || '') + '</div></td>' +
+      '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
+      '<td>' + itemsStr + '</td>' +
+      '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
+      '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
+      '<td>' + escapeHtml(dateStr) + '</td>' +
+      '<td><div class="actions-cell">' +
+        '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Accept</button>' +
+        '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Reject</button>' +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+
+  var buttons = tbody.querySelectorAll('[data-action]');
+  for (var i = 0; i < buttons.length; i++) {
+    buttons[i].addEventListener('click', function () {
+      updateOrder(this.dataset.id, this.dataset.action);
+    });
+  }
+}
+
+function updateOrder(orderId, action) {
+  if (!confirm('Are you sure you want to ' + action + ' order ' + orderId + '?')) return;
+
+  fetch('/api/admin/update-order', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ orderId: orderId, action: action })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (!data.success) throw new Error(data.error || 'Failed');
+      showToast('Order ' + orderId + ' ' + action + 'ed successfully.', 'success');
+      loadStats();
+    })
+    .catch(function (err) {
+      console.error(err);
+      showToast('Failed: ' + err.message, 'error');
+    });
+}
+
+function resetTimers() {
+  clearInterval(refreshTimer);
+  clearInterval(countdownTimer);
+  secondsLeft = 15;
+  document.getElementById('countdown').textContent = secondsLeft;
+
+  countdownTimer = setInterval(function () {
+    secondsLeft--;
+    if (secondsLeft < 0) secondsLeft = 15;
+    document.getElementById('countdown').textContent = secondsLeft;
+  }, 1000);
+
+  refreshTimer = setInterval(function () {
+    loadStats();
+    secondsLeft = 15;
+  }, 15000);
+}
+
+document.getElementById('refreshBtn').addEventListener('click', function () {
+  loadStats();
+  secondsLeft = 15;
+  showToast('Refreshed.', 'success');
+});
+
+document.getElementById('searchInput').addEventListener('input', renderOrders);
+document.getElementById('filterStatus').addEventListener('change', renderOrders);
+
+loadStats();
+resetTimers();
+</script>
+</body>
+</html>`;
+
+app.get('/admin', adminAuth, (req, res) => {
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(ADMIN_HTML);
+});
+
+/* =========================================================
+   PENDING PAYPAL ORDERS
+   ========================================================= */
+const pendingPayPalOrders = new Map();
+
+/* =========================================================
    DISCORD INTERACTIONS
    ========================================================= */
 client.on('interactionCreate', async interaction => {
@@ -1181,7 +1662,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'accept') {
-            await updateOrderStatus(order.id, 'مقبول');
+            await updateOrderStatus(order.id, 'approved');
             await interaction.update({
                 content: interaction.message.content.replace(
                     '⏳ Pending',
@@ -1194,7 +1675,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'reject') {
-            await updateOrderStatus(order.id, 'مرفوض');
+            await updateOrderStatus(order.id, 'rejected');
             await interaction.update({
                 content: interaction.message.content.replace(
                     '⏳ Pending',
@@ -1222,6 +1703,7 @@ client.once('ready', async () => {
     console.log(`[PAYPAL] Mode: ${PAYPAL_MODE}`);
     console.log(`[PAYPAL] Configured: ${Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET)}`);
     console.log(`[INVOICE] Canvas: ${createCanvas ? 'OK' : 'DISABLED'}`);
+    console.log(`[ADMIN] Password set: ${Boolean(ADMIN_PASSWORD)}`);
     console.log(`[DB] Configured: ${Boolean(DATABASE_URL)}`);
 
     await initDatabase();
