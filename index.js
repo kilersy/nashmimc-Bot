@@ -1,14 +1,10 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v5
-   Features:
-   - Discord bot with order notifications
-   - PayPal integration (auto-capture verification)
-   - USDT TRC20 manual payment with proof images
-   - Auto-generated PNG invoice images
-   - PostgreSQL persistence
-   - Rate limiting + strict input validation
-   - XSS sanitization
-   - Admin dashboard with Accept/Reject
+   NashmiMC Store Bot — Production Build v6
+   Fixes:
+   - getStats consistency (single query)
+   - Auto-normalize legacy Arabic statuses
+   - Reset button on admin dashboard
+   - Accept/Reject/Reset in admin
    ========================================================= */
 
 'use strict';
@@ -253,27 +249,43 @@ async function getStats() {
     }
 
     try {
-        const totalResult = await db.query('SELECT COUNT(*)::int AS count FROM orders');
-        const statusResult = await db.query(
-            `SELECT status, COUNT(*)::int AS count FROM orders GROUP BY status`
-        );
-        const revenueResult = await db.query(
-            `SELECT COALESCE(SUM(total), 0)::numeric AS revenue
-             FROM orders WHERE status = 'approved' OR status = 'مقبول'`
-        );
-        const recentResult = await db.query(
-            `SELECT * FROM orders ORDER BY created_at DESC LIMIT 100`
-        );
+        // Auto-normalize any legacy Arabic statuses
+        await db.query(`UPDATE orders SET status = 'pending'  WHERE status IN ('قيد الانتظار', 'pending')`);
+        await db.query(`UPDATE orders SET status = 'approved' WHERE status IN ('مقبول', 'approved')`);
+        await db.query(`UPDATE orders SET status = 'rejected' WHERE status IN ('مرفوض', 'rejected')`);
 
-        const byStatus = {};
-        statusResult.rows.forEach(r => {
-            byStatus[r.status] = r.count;
-        });
+        // Single query for consistent counters
+        const countersResult = await db.query(`
+            SELECT
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status = 'pending')::int  AS pending,
+              COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+              COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+            FROM orders
+        `);
+
+        const counters = countersResult.rows[0];
+
+        const revenueResult = await db.query(`
+            SELECT COALESCE(SUM(total), 0)::numeric AS revenue
+            FROM orders
+            WHERE status = 'approved'
+        `);
+
+        const recentResult = await db.query(`
+            SELECT * FROM orders
+            ORDER BY created_at DESC
+            LIMIT 100
+        `);
 
         return {
             ok: true,
-            totalOrders: totalResult.rows[0].count,
-            byStatus,
+            totalOrders: counters.total,
+            byStatus: {
+                'pending':  counters.pending,
+                'approved': counters.approved,
+                'rejected': counters.rejected
+            },
             totalRevenue: Number(revenueResult.rows[0].revenue),
             recentOrders: recentResult.rows.map(rowToOrder)
         };
@@ -960,10 +972,20 @@ app.get('/health', async (req, res) => {
 });
 
 /* =========================================================
-   STATS API
+   STATS API (with cache)
    ========================================================= */
+let statsCache = { data: null, timestamp: 0 };
+const STATS_CACHE_TTL = 10000;
+
 app.get('/api/stats', trackingLimiter, async (req, res) => {
+    const now = Date.now();
+
+    if (statsCache.data && (now - statsCache.timestamp) < STATS_CACHE_TTL) {
+        return res.json(statsCache.data);
+    }
+
     const stats = await getStats();
+    statsCache = { data: stats, timestamp: now };
     res.json(stats);
 });
 
@@ -1191,7 +1213,7 @@ app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
 });
 
 /* =========================================================
-   POST /api/admin/update-order
+   POST /api/admin/update-order — accept / reject / reset
    ========================================================= */
 app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) => {
     try {
@@ -1201,8 +1223,9 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
             return res.status(400).json({ success: false, error: 'orderId is required.' });
         }
 
-        if (action !== 'accept' && action !== 'reject') {
-            return res.status(400).json({ success: false, error: 'action must be accept or reject.' });
+        const validActions = ['accept', 'reject', 'reset'];
+        if (!validActions.includes(action)) {
+            return res.status(400).json({ success: false, error: 'action must be accept, reject, or reset.' });
         }
 
         const order = await findOrderById(orderId);
@@ -1210,14 +1233,18 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
             return res.status(404).json({ success: false, error: 'Order not found.' });
         }
 
-        const newStatus = action === 'accept' ? 'approved' : 'rejected';
+        let newStatus;
+        if (action === 'accept') newStatus = 'approved';
+        else if (action === 'reject') newStatus = 'rejected';
+        else newStatus = 'pending';
+
         const updated = await updateOrderStatus(order.id, newStatus);
 
         if (!updated) {
             return res.status(500).json({ success: false, error: 'Failed to update order status.' });
         }
 
-        console.log('[ADMIN] Order ' + order.id + ' ' + action + 'ed.');
+        console.log('[ADMIN] Order ' + order.id + ' → ' + newStatus);
 
         return res.json({ success: true, orderId: order.id, status: newStatus });
     } catch (error) {
@@ -1237,181 +1264,62 @@ const ADMIN_HTML = `<!DOCTYPE html>
 <title>NashmiMC Admin — Orders</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #0a0e1a;
-    --card: #131b2e;
-    --card-hover: #1a2340;
-    --border: #2d3654;
-    --accent: #fbbf24;
-    --text: #f1f5f9;
-    --muted: #94a3b8;
-    --success: #10b981;
-    --danger: #ef4444;
-    --warning: #f59e0b;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: 'Inter', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    padding: 20px;
-  }
-  .container { max-width: 1500px; margin: 0 auto; }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 20px 0;
-    border-bottom: 2px solid var(--border);
-    margin-bottom: 30px;
-    flex-wrap: wrap;
-    gap: 15px;
-  }
-  h1 { font-size: 1.8rem; color: var(--accent); font-weight: 800; letter-spacing: -0.5px; }
-  h1 span { color: var(--text); font-weight: 400; font-size: 0.95rem; margin-left: 12px; }
-  .refresh-info { font-size: 0.85rem; color: var(--muted); }
-  .refresh-info strong { color: var(--accent); }
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 15px;
-    margin-bottom: 30px;
-  }
-  .stat-card {
-    background: var(--card);
-    border: 2px solid var(--border);
-    border-radius: 14px;
-    padding: 22px;
-    transition: all 0.2s;
-  }
-  .stat-card:hover { border-color: var(--accent); transform: translateY(-2px); }
-  .stat-label {
-    font-size: 0.85rem;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-bottom: 8px;
-    font-weight: 600;
-  }
-  .stat-value { font-size: 2.2rem; font-weight: 800; color: var(--accent); }
-  .stat-value.green { color: var(--success); }
-  .stat-value.red { color: var(--danger); }
-  .stat-value.yellow { color: var(--warning); }
-  .search-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-  .search-bar input, .search-bar select {
-    background: var(--card);
-    border: 2px solid var(--border);
-    color: var(--text);
-    padding: 12px 16px;
-    border-radius: 10px;
-    font-size: 0.95rem;
-    outline: none;
-    font-family: inherit;
-  }
-  .search-bar input { flex: 1; min-width: 200px; }
-  .search-bar input:focus, .search-bar select:focus { border-color: var(--accent); }
-  .search-bar button {
-    background: var(--accent);
-    color: var(--bg);
-    border: none;
-    padding: 12px 22px;
-    border-radius: 10px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-  .search-bar button:hover { transform: scale(1.03); }
-  .orders-table-wrapper {
-    background: var(--card);
-    border: 2px solid var(--border);
-    border-radius: 14px;
-    overflow: hidden;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-  thead { background: #0f1524; border-bottom: 2px solid var(--border); }
-  th {
-    text-align: left;
-    padding: 14px 16px;
-    color: var(--accent);
-    font-weight: 700;
-    font-size: 0.8rem;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  td { padding: 14px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  tbody tr:hover { background: var(--card-hover); }
-  tbody tr:last-child td { border-bottom: none; }
-  .order-id { font-family: monospace; color: var(--accent); font-weight: 600; font-size: 0.85rem; }
-  .ign { font-weight: 600; }
-  .discord { color: var(--muted); font-size: 0.85rem; }
-  .method-badge {
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-weight: 700;
-    font-size: 0.75rem;
-    letter-spacing: 0.5px;
-  }
-  .method-paypal { background: #003087; color: #fff; }
-  .method-crypto { background: #26a17b; color: #fff; }
-  .status-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 14px;
-    border-radius: 20px;
-    font-weight: 700;
-    font-size: 0.8rem;
-    white-space: nowrap;
-  }
-  .status-pending { background: rgba(245, 158, 11, 0.2); color: var(--warning); border: 1px solid var(--warning); }
-  .status-approved { background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); }
-  .status-rejected { background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid var(--danger); }
-  .total-cell { font-weight: 800; color: var(--accent); font-family: monospace; font-size: 1rem; }
-  .actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
-  .btn-action {
-    border: none;
-    padding: 7px 14px;
-    border-radius: 8px;
-    font-weight: 700;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: all 0.15s;
-    font-family: inherit;
-  }
-  .btn-accept { background: var(--success); color: #fff; }
-  .btn-accept:hover:not(:disabled) { background: #059669; }
-  .btn-reject { background: var(--danger); color: #fff; }
-  .btn-reject:hover:not(:disabled) { background: #b91c1c; }
-  .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
-  .empty-state { text-align: center; padding: 60px 20px; color: var(--muted); }
-  .toast {
-    position: fixed;
-    bottom: 30px;
-    right: 30px;
-    background: var(--card);
-    border: 2px solid var(--accent);
-    border-radius: 12px;
-    padding: 16px 22px;
-    font-weight: 600;
-    color: var(--text);
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-    transform: translateY(100px);
-    opacity: 0;
-    transition: all 0.3s;
-    z-index: 9999;
-    max-width: 350px;
-  }
-  .toast.show { transform: translateY(0); opacity: 1; }
-  .toast.success { border-color: var(--success); }
-  .toast.error { border-color: var(--danger); }
-  @media (max-width: 900px) {
-    table { font-size: 0.8rem; }
-    th, td { padding: 10px 12px; }
-    h1 { font-size: 1.4rem; }
-    h1 span { display: block; margin-left: 0; margin-top: 4px; }
-  }
+  :root { --bg:#0a0e1a; --card:#131b2e; --card-hover:#1a2340; --border:#2d3654; --accent:#fbbf24; --text:#f1f5f9; --muted:#94a3b8; --success:#10b981; --danger:#ef4444; --warning:#f59e0b; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Inter',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:20px; }
+  .container { max-width:1500px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:20px 0; border-bottom:2px solid var(--border); margin-bottom:30px; flex-wrap:wrap; gap:15px; }
+  h1 { font-size:1.8rem; color:var(--accent); font-weight:800; letter-spacing:-0.5px; }
+  h1 span { color:var(--text); font-weight:400; font-size:0.95rem; margin-left:12px; }
+  .refresh-info { font-size:0.85rem; color:var(--muted); }
+  .refresh-info strong { color:var(--accent); }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:15px; margin-bottom:30px; }
+  .stat-card { background:var(--card); border:2px solid var(--border); border-radius:14px; padding:22px; transition:all 0.2s; }
+  .stat-card:hover { border-color:var(--accent); transform:translateY(-2px); }
+  .stat-label { font-size:0.85rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px; font-weight:600; }
+  .stat-value { font-size:2.2rem; font-weight:800; color:var(--accent); }
+  .stat-value.green { color:var(--success); }
+  .stat-value.red { color:var(--danger); }
+  .stat-value.yellow { color:var(--warning); }
+  .search-bar { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+  .search-bar input, .search-bar select { background:var(--card); border:2px solid var(--border); color:var(--text); padding:12px 16px; border-radius:10px; font-size:0.95rem; outline:none; font-family:inherit; }
+  .search-bar input { flex:1; min-width:200px; }
+  .search-bar input:focus, .search-bar select:focus { border-color:var(--accent); }
+  .search-bar button { background:var(--accent); color:var(--bg); border:none; padding:12px 22px; border-radius:10px; font-weight:700; cursor:pointer; transition:all 0.2s; }
+  .search-bar button:hover { transform:scale(1.03); }
+  .orders-table-wrapper { background:var(--card); border:2px solid var(--border); border-radius:14px; overflow:hidden; }
+  table { width:100%; border-collapse:collapse; font-size:0.9rem; }
+  thead { background:#0f1524; border-bottom:2px solid var(--border); }
+  th { text-align:left; padding:14px 16px; color:var(--accent); font-weight:700; font-size:0.8rem; text-transform:uppercase; letter-spacing:0.5px; }
+  td { padding:14px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  tbody tr:hover { background:var(--card-hover); }
+  tbody tr:last-child td { border-bottom:none; }
+  .order-id { font-family:monospace; color:var(--accent); font-weight:600; font-size:0.85rem; }
+  .ign { font-weight:600; }
+  .discord { color:var(--muted); font-size:0.85rem; }
+  .method-badge { display:inline-block; padding:4px 10px; border-radius:6px; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; }
+  .method-paypal { background:#003087; color:#fff; }
+  .method-crypto { background:#26a17b; color:#fff; }
+  .status-badge { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:20px; font-weight:700; font-size:0.8rem; white-space:nowrap; }
+  .status-pending { background:rgba(245,158,11,0.2); color:var(--warning); border:1px solid var(--warning); }
+  .status-approved { background:rgba(16,185,129,0.2); color:var(--success); border:1px solid var(--success); }
+  .status-rejected { background:rgba(239,68,68,0.2); color:var(--danger); border:1px solid var(--danger); }
+  .total-cell { font-weight:800; color:var(--accent); font-family:monospace; font-size:1rem; }
+  .actions-cell { display:flex; gap:6px; flex-wrap:wrap; }
+  .btn-action { border:none; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; cursor:pointer; transition:all 0.15s; font-family:inherit; }
+  .btn-accept { background:var(--success); color:#fff; }
+  .btn-accept:hover:not(:disabled) { background:#059669; }
+  .btn-reject { background:var(--danger); color:#fff; }
+  .btn-reject:hover:not(:disabled) { background:#b91c1c; }
+  .btn-reset { background:#6366f1; color:#fff; }
+  .btn-reset:hover { background:#4f46e5; }
+  .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
+  .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
+  .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
+  .toast.show { transform:translateY(0); opacity:1; }
+  .toast.success { border-color:var(--success); }
+  .toast.error { border-color:var(--danger); }
+  @media (max-width:900px) { table { font-size:0.8rem; } th, td { padding:10px 12px; } h1 { font-size:1.4rem; } h1 span { display:block; margin-left:0; margin-top:4px; } }
 </style>
 </head>
 <body>
@@ -1470,12 +1378,7 @@ var secondsLeft = 15;
 var allOrders = [];
 
 function escapeHtml(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
 function showToast(message, type) {
@@ -1486,9 +1389,9 @@ function showToast(message, type) {
 }
 
 function statusInfo(status) {
-  if (status === 'approved' || status === 'مقبول') return { cls: 'status-approved', icon: '\\u2713', label: 'Approved' };
-  if (status === 'rejected' || status === 'مرفوض') return { cls: 'status-rejected', icon: '\\u2715', label: 'Rejected' };
-  return { cls: 'status-pending', icon: '\\u23F1', label: 'Pending' };
+  if (status === 'approved' || status === 'مقبول') return { cls:'status-approved', icon:'\\u2713', label:'Approved' };
+  if (status === 'rejected' || status === 'مرفوض') return { cls:'status-rejected', icon:'\\u2715', label:'Rejected' };
+  return { cls:'status-pending', icon:'\\u23F1', label:'Pending' };
 }
 
 function loadStats() {
@@ -1496,35 +1399,29 @@ function loadStats() {
     .then(function (r) { return r.json(); })
     .then(function (data) {
       if (!data.ok) throw new Error(data.error || 'Failed');
-
       document.getElementById('statTotal').textContent = data.totalOrders || 0;
       var byStatus = data.byStatus || {};
-      document.getElementById('statPending').textContent = (byStatus['pending'] || 0) + (byStatus['قيد الانتظار'] || 0);
-      document.getElementById('statApproved').textContent = (byStatus['approved'] || 0) + (byStatus['مقبول'] || 0);
-      document.getElementById('statRejected').textContent = (byStatus['rejected'] || 0) + (byStatus['مرفوض'] || 0);
+      document.getElementById('statPending').textContent = byStatus['pending'] || 0;
+      document.getElementById('statApproved').textContent = byStatus['approved'] || 0;
+      document.getElementById('statRejected').textContent = byStatus['rejected'] || 0;
       document.getElementById('statRevenue').textContent = '$' + Number(data.totalRevenue || 0).toFixed(2);
-
       allOrders = data.recentOrders || [];
       renderOrders();
     })
-    .catch(function (err) {
-      console.error(err);
-      showToast('Failed to load orders', 'error');
-    });
+    .catch(function (err) { console.error(err); showToast('Failed to load orders', 'error'); });
 }
 
 function renderOrders() {
   var tbody = document.getElementById('ordersTbody');
   var search = document.getElementById('searchInput').value.trim().toLowerCase();
   var filterStatus = document.getElementById('filterStatus').value;
-
   var filtered = allOrders;
 
   if (search) {
     filtered = filtered.filter(function (o) {
-      return String(o.id || '').toLowerCase().indexOf(search) !== -1 ||
-             String(o.ign || '').toLowerCase().indexOf(search) !== -1 ||
-             String(o.discordUser || '').toLowerCase().indexOf(search) !== -1;
+      return String(o.id||'').toLowerCase().indexOf(search) !== -1 ||
+             String(o.ign||'').toLowerCase().indexOf(search) !== -1 ||
+             String(o.discordUser||'').toLowerCase().indexOf(search) !== -1;
     });
   }
 
@@ -1545,16 +1442,13 @@ function renderOrders() {
   tbody.innerHTML = filtered.map(function (o) {
     var si = statusInfo(o.status);
     var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
-    var itemsStr = Array.isArray(o.items)
-      ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>')
-      : '—';
+    var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
     var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
     var isPending = (o.status === 'pending' || o.status === 'قيد الانتظار');
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
       '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
-      '<td><div class="ign">' + escapeHtml(o.ign || '—') + '</div>' +
-      '<div class="discord">' + escapeHtml(o.discordUser || '') + '</div></td>' +
+      '<td><div class="ign">' + escapeHtml(o.ign || '—') + '</div><div class="discord">' + escapeHtml(o.discordUser || '') + '</div></td>' +
       '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
       '<td>' + itemsStr + '</td>' +
       '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
@@ -1563,6 +1457,7 @@ function renderOrders() {
       '<td><div class="actions-cell">' +
         '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Accept</button>' +
         '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '"' + (isPending ? '' : ' disabled') + '>Reject</button>' +
+        '<button class="btn-action btn-reset" data-action="reset" data-id="' + escapeHtml(o.id) + '">Reset</button>' +
       '</div></td>' +
     '</tr>';
   }).join('');
@@ -1577,7 +1472,6 @@ function renderOrders() {
 
 function updateOrder(orderId, action) {
   if (!confirm('Are you sure you want to ' + action + ' order ' + orderId + '?')) return;
-
   fetch('/api/admin/update-order', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1589,10 +1483,7 @@ function updateOrder(orderId, action) {
       showToast('Order ' + orderId + ' ' + action + 'ed successfully.', 'success');
       loadStats();
     })
-    .catch(function (err) {
-      console.error(err);
-      showToast('Failed: ' + err.message, 'error');
-    });
+    .catch(function (err) { console.error(err); showToast('Failed: ' + err.message, 'error'); });
 }
 
 function resetTimers() {
@@ -1607,10 +1498,7 @@ function resetTimers() {
     document.getElementById('countdown').textContent = secondsLeft;
   }, 1000);
 
-  refreshTimer = setInterval(function () {
-    loadStats();
-    secondsLeft = 15;
-  }, 15000);
+  refreshTimer = setInterval(function () { loadStats(); secondsLeft = 15; }, 15000);
 }
 
 document.getElementById('refreshBtn').addEventListener('click', function () {
@@ -1664,10 +1552,7 @@ client.on('interactionCreate', async interaction => {
         if (action === 'accept') {
             await updateOrderStatus(order.id, 'approved');
             await interaction.update({
-                content: interaction.message.content.replace(
-                    '⏳ Pending',
-                    `✅ **Accepted** (by ${interaction.user.tag})`
-                ),
+                content: interaction.message.content.replace('⏳ Pending', `✅ **Accepted** (by ${interaction.user.tag})`),
                 components: []
             });
             console.log(`[ORDER] ${order.id} accepted by ${interaction.user.tag}`);
@@ -1677,10 +1562,7 @@ client.on('interactionCreate', async interaction => {
         if (action === 'reject') {
             await updateOrderStatus(order.id, 'rejected');
             await interaction.update({
-                content: interaction.message.content.replace(
-                    '⏳ Pending',
-                    `❌ **Rejected** (by ${interaction.user.tag})`
-                ),
+                content: interaction.message.content.replace('⏳ Pending', `❌ **Rejected** (by ${interaction.user.tag})`),
                 components: []
             });
             console.log(`[ORDER] ${order.id} rejected by ${interaction.user.tag}`);
@@ -1730,12 +1612,8 @@ client.login(process.env.DISCORD_TOKEN);
    ========================================================= */
 async function shutdown(signal) {
     console.log(`[SHUTDOWN] Received ${signal}. Cleaning up...`);
-    try {
-        if (db) await db.end();
-    } catch (_) { /* ignore */ }
-    try {
-        client.destroy();
-    } catch (_) { /* ignore */ }
+    try { if (db) await db.end(); } catch (_) { /* ignore */ }
+    try { client.destroy(); } catch (_) { /* ignore */ }
     process.exit(0);
 }
 
