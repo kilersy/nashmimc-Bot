@@ -1,10 +1,8 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v9
-   Change from v8:
-   - Buttons adapt to status:
-     * pending  → Accept + Reject + Reset
-     * approved → Reset only
-     * rejected → Reset only
+   NashmiMC Store Bot — Production Build v10 (Fixed & Complete)
+   Changes:
+   - Replaced in-memory pendingPayPalOrders with DB table for persistence.
+   - Added PayPal Webhook to catch payments even if frontend fails.
    ========================================================= */
 
 'use strict';
@@ -42,6 +40,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
 const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'live').toLowerCase();
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '';
 const PAYPAL_BASE_URL = PAYPAL_MODE === 'sandbox'
     ? 'https://api-m.sandbox.paypal.com'
     : 'https://api-m.paypal.com';
@@ -146,6 +145,21 @@ async function initDatabase() {
             )
         `);
 
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS pending_paypal_orders (
+                paypal_order_id   VARCHAR(128) PRIMARY KEY,
+                internal_order_id VARCHAR(64) NOT NULL,
+                client_order_id   VARCHAR(100),
+                ign               VARCHAR(16) NOT NULL,
+                discord_user      VARCHAR(64) NOT NULL,
+                subtotal          NUMERIC(10, 2) NOT NULL,
+                total             NUMERIC(10, 2) NOT NULL,
+                coupon_code       VARCHAR(32),
+                items             JSONB NOT NULL,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_message_id VARCHAR(64)`);
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discord_channel_id VARCHAR(64)`);
 
@@ -232,6 +246,61 @@ async function findOrderById(id) {
     } catch (err) {
         console.error('[DB] findOrderById failed:', err.message);
         return null;
+    }
+}
+
+async function findOrderByPaypalId(paypalOrderId) {
+    if (!dbReady || !paypalOrderId) return null;
+    try {
+        const result = await db.query(`SELECT * FROM orders WHERE paypal_order_id = $1 LIMIT 1`, [paypalOrderId]);
+        if (result.rows.length === 0) return null;
+        return rowToOrder(result.rows[0]);
+    } catch (err) {
+        console.error('[DB] findOrderByPaypalId failed:', err.message);
+        return null;
+    }
+}
+
+async function savePendingPayPalOrder(pending) {
+    if (!dbReady) return false;
+    try {
+        await db.query(
+            `INSERT INTO pending_paypal_orders (paypal_order_id, internal_order_id, client_order_id, ign, discord_user, subtotal, total, coupon_code, items) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [pending.paypalOrderId, pending.internalOrderId, pending.clientOrderId, pending.ign,
+             pending.discordUser, pending.subtotal, pending.total, pending.couponCode, JSON.stringify(pending.items)]
+        );
+        return true;
+    } catch (err) {
+        console.error('[DB] savePendingPayPalOrder failed:', err.message);
+        return false;
+    }
+}
+
+async function getPendingPayPalOrder(paypalOrderId) {
+    if (!dbReady) return null;
+    try {
+        const result = await db.query(`SELECT * FROM pending_paypal_orders WHERE paypal_order_id = $1`, [paypalOrderId]);
+        if (result.rows.length === 0) return null;
+        const row = result.rows[0];
+        return {
+            internalOrderId: row.internal_order_id, clientOrderId: row.client_order_id,
+            ign: row.ign, discordUser: row.discord_user, subtotal: Number(row.subtotal),
+            total: Number(row.total), couponCode: row.coupon_code, items: row.items
+        };
+    } catch (err) {
+        console.error('[DB] getPendingPayPalOrder failed:', err.message);
+        return null;
+    }
+}
+
+async function deletePendingPayPalOrder(paypalOrderId) {
+    if (!dbReady) return false;
+    try {
+        await db.query(`DELETE FROM pending_paypal_orders WHERE paypal_order_id = $1`, [paypalOrderId]);
+        return true;
+    } catch (err) {
+        return false;
     }
 }
 
@@ -792,12 +861,6 @@ async function sendPaymentProof(channel, imageProof) {
     return true;
 }
 
-/**
- * Build action buttons based on current order status.
- * - pending  → Accept + Reject + Reset
- * - approved → Reset only
- * - rejected → Reset only
- */
 function buildActionButtons(orderId, currentStatus) {
     const row = new ActionRowBuilder();
     const status = String(currentStatus || 'pending').toLowerCase();
@@ -820,7 +883,6 @@ function buildActionButtons(orderId, currentStatus) {
         );
     }
 
-    // Reset button always present
     row.addComponents(
         new ButtonBuilder()
             .setCustomId(`reset_${orderId}`)
@@ -915,7 +977,6 @@ async function syncDiscordMessage(orderId, newStatus, actorName) {
             newContent += `\n${newStatusLine}`;
         }
 
-        // Status-aware buttons: only Reset when not pending
         const components = [buildActionButtons(orderId, newStatus)];
 
         await message.edit({
@@ -1201,7 +1262,8 @@ app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
             throw new Error('PayPal did not return an order ID.');
         }
 
-        pendingPayPalOrders.set(paypalOrder.id, {
+        await savePendingPayPalOrder({
+            paypalOrderId: paypalOrder.id,
             internalOrderId,
             clientOrderId: normalizeText(clientOrderId, 100),
             ign: ign.trim(),
@@ -1209,8 +1271,7 @@ app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
             items: cart.items,
             subtotal: cart.subtotal,
             total,
-            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null,
-            createdAt: Date.now()
+            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null
         });
 
         console.log(`[PAYPAL] Created ${paypalOrder.id} for ${total.toFixed(2)} USD`);
@@ -1242,18 +1303,17 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
             return res.status(400).json({ success: false, error: 'PayPal order ID is required.' });
         }
 
-        const pending = pendingPayPalOrders.get(paypalOrderId);
+        const pending = await getPendingPayPalOrder(paypalOrderId);
+        
         if (!pending) {
+            const existingOrder = await findOrderByPaypalId(paypalOrderId);
+            if (existingOrder) {
+                return res.json({ success: true, orderId: existingOrder.id, paypalOrderId, total: existingOrder.total, status: existingOrder.status });
+            }
             return res.status(404).json({
                 success: false,
                 error: 'PayPal order session not found or expired. Please start again.'
             });
-        }
-
-        const maxPendingAge = 30 * 60 * 1000;
-        if (Date.now() - pending.createdAt > maxPendingAge) {
-            pendingPayPalOrders.delete(paypalOrderId);
-            return res.status(410).json({ success: false, error: 'PayPal payment session expired.' });
         }
 
         const paypalResponse = await paypalCaptureOrder(paypalOrderId);
@@ -1288,7 +1348,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
         await addOrder(order);
         await createDiscordOrder(order, null);
 
-        pendingPayPalOrders.delete(paypalOrderId);
+        await deletePendingPayPalOrder(paypalOrderId);
 
         console.log(`[SUCCESS] PayPal payment completed for ${order.id}`);
 
@@ -1301,10 +1361,87 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
         });
     } catch (error) {
         console.error('[PAYPAL] Capture order failed:', error);
+        
+        if (error.message && error.message.includes('ORDER_ALREADY_CAPTURED')) {
+            const existingOrder = await findOrderByPaypalId(req.body.paypalOrderId);
+            if (existingOrder) {
+                return res.json({ success: true, orderId: existingOrder.id, paypalOrderId: req.body.paypalOrderId, total: existingOrder.total, status: existingOrder.status });
+            }
+        }
+
         return res.status(500).json({
             success: false,
             error: error.message || 'Unable to capture PayPal payment.'
         });
+    }
+});
+
+/* =========================================================
+   POST /api/paypal/webhook (NEW)
+   ========================================================= */
+app.post('/api/paypal/webhook', async (req, res) => {
+    res.status(200).send('OK');
+    
+    try {
+        const event = req.body;
+
+        if (PAYPAL_WEBHOOK_ID && event.event_type) {
+            const verifyResponse = await fetch(`${PAYPAL_BASE_URL}/v1/notifications/verify-webhook-signature`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${await paypalAccessToken()}`
+                },
+                body: JSON.stringify({
+                    auth_algo: req.headers['paypal-auth-algo'],
+                    cert_url: req.headers['paypal-cert-url'],
+                    transmission_id: req.headers['paypal-transmission-id'],
+                    transmission_sig: req.headers['paypal-transmission-sig'],
+                    transmission_time: req.headers['paypal-transmission-time'],
+                    webhook_id: PAYPAL_WEBHOOK_ID,
+                    webhook_event: event
+                })
+            });
+            const verifyData = await verifyResponse.json();
+            if (verifyData.verification_status !== 'SUCCESS') {
+                console.error('[WEBHOOK] Invalid signature.');
+                return;
+            }
+        }
+
+        if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED' || event.event_type === 'CHECKOUT.ORDER.APPROVED') {
+            const paypalOrderId = event.resource?.supplementary_data?.related_ids?.order_id || event.resource?.id;
+            if (!paypalOrderId) return;
+
+            const pending = await getPendingPayPalOrder(paypalOrderId);
+            if (!pending) return;
+
+            const existingOrder = await findOrderByPaypalId(paypalOrderId);
+            if (existingOrder) return;
+
+            console.log(`[WEBHOOK] Processing order ${paypalOrderId} automatically via Webhook.`);
+            
+            const order = {
+                id: pending.internalOrderId,
+                ign: pending.ign,
+                discordUser: pending.discordUser,
+                paymentMethod: 'PAYPAL',
+                paymentReference: `PayPal Webhook: ${paypalOrderId}`,
+                subtotal: pending.subtotal,
+                total: pending.total,
+                couponCode: pending.couponCode,
+                items: pending.items,
+                date: new Date().toISOString(),
+                status: 'pending',
+                paypalOrderId
+            };
+
+            await addOrder(order);
+            await createDiscordOrder(order, null);
+            await deletePendingPayPalOrder(paypalOrderId);
+        }
+    } catch (error) {
+        console.error('[WEBHOOK] Error:', error.message);
     }
 });
 
@@ -1727,11 +1864,6 @@ app.get('/admin', adminAuth, (req, res) => {
 });
 
 /* =========================================================
-   PENDING PAYPAL ORDERS
-   ========================================================= */
-const pendingPayPalOrders = new Map();
-
-/* =========================================================
    DISCORD INTERACTIONS
    ========================================================= */
 client.on('interactionCreate', async interaction => {
@@ -1788,10 +1920,6 @@ client.on('interactionCreate', async interaction => {
             newContent = newContent.replace(statusLineRegex, newStatusLine);
         }
 
-        // Status-aware buttons:
-        // pending  → Accept + Reject + Reset
-        // approved → Reset only
-        // rejected → Reset only
         const components = [buildActionButtons(order.id, newStatus)];
 
         await interaction.update({
@@ -1856,6 +1984,6 @@ process.on('unhandledRejection', (reason) => {
     console.error('[UNHANDLED REJECTION]', reason);
 });
 
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', (error) {
     console.error('[UNCAUGHT EXCEPTION]', error);
 });
