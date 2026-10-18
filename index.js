@@ -1,5 +1,9 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10.5 (Full & Complete)
+   NashmiMC Store Bot — Production Build v10.6 (Final & Fixed)
+   Changes:
+   - Fixed syntax error in createDiscordOrder.
+   - Added fallback in capture-order.
+   - Added trust proxy for Render (fixes express-rate-limit crash).
    ========================================================= */
 
 'use strict';
@@ -384,6 +388,8 @@ async function getStats() {
 /* =========================================================
    EXPRESS
    ========================================================= */
+app.set('trust proxy', 1);
+
 app.use(express.json({ limit: '12mb' }));
 app.use(express.urlencoded({ limit: '12mb', extended: true }));
 
