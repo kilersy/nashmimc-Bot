@@ -1,9 +1,5 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10.8 (Final & Fixed)
-   Changes:
-   - Increased Rate Limit to fix Admin Panel loading loop.
-   - Disabled Rate Limit on /api/stats to fix Admin Panel.
-   - Removed shutdown function to prevent SIGTERM kills on Render.
+   NashmiMC Store Bot — Production Build v11.1 (Full & Complete)
    ========================================================= */
 
 'use strict';
@@ -413,7 +409,7 @@ app.use((req, res, next) => {
 
 const globalLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 500, // رفعنا الحد الأقصى عشان نمنع الحظر
+    max: 500,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many requests. Please slow down.' }
@@ -1163,7 +1159,6 @@ let statsCache = { data: null, timestamp: 0 };
 const STATS_CACHE_TTL = 10000;
 
 app.get('/api/stats', async (req, res) => {
-    // شلنا الـ trackingLimiter من هنا عشان لوحة الأدمن تفتح
     const now = Date.now();
 
     if (statsCache.data && (now - statsCache.timestamp) < STATS_CACHE_TTL) {
