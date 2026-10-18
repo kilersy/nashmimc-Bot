@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + Images)
+   NashmiMC Store — Webhook Only (Full Admin + Image URL)
    ========================================================= */
 
 'use strict';
@@ -7,6 +7,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 
@@ -18,6 +19,8 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
+
+console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET' : 'MISSING!');
 
 /* =========================================================
    PRODUCT CATALOG
@@ -57,7 +60,7 @@ async function initDatabase() {
                 payment_method VARCHAR(16) NOT NULL, payment_reference VARCHAR(255), subtotal NUMERIC(10, 2) NOT NULL,
                 total NUMERIC(10, 2) NOT NULL, coupon_code VARCHAR(32), items JSONB NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending', 
-                image_proof TEXT, 
+                image_url TEXT, 
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
@@ -72,7 +75,7 @@ function rowToOrder(row) {
     return {
         id: row.id, ign: row.ign, discordUser: row.discord_user, paymentMethod: row.payment_method,
         paymentReference: row.payment_reference, subtotal: Number(row.subtotal), total: Number(row.total),
-        couponCode: row.coupon_code, items: row.items, status: row.status, imageProof: row.image_proof,
+        couponCode: row.coupon_code, items: row.items, status: row.status, imageUrl: row.image_url,
         date: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at)
     };
 }
@@ -81,10 +84,10 @@ async function addOrder(order) {
     if (!dbReady) return false;
     try {
         await db.query(
-            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status, image_proof) 
+            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status, image_url) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [order.id, order.ign, order.discordUser, order.paymentMethod, order.paymentReference || null,
-             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status, order.imageProof || null]
+             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status, order.imageUrl || null]
         );
         return true;
     } catch (err) { console.error('[DB] addOrder failed:', err.message); return false; }
@@ -187,37 +190,72 @@ function validateAndBuildCart(items) {
     return { items: validatedItems, subtotal: roundMoney(validatedItems.reduce((sum, item) => sum + Number(item.price), 0)) };
 }
 
-async function sendDiscordWebhook(order, imageProof = null) {
+async function sendDiscordWebhook(order) {
     if (!DISCORD_WEBHOOK_URL) {
         console.warn('[WEBHOOK] DISCORD_WEBHOOK_URL is not set.');
-        return;
+        return null;
     }
 
     try {
         console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
         
-        const content = `🛒 **New Manual Order!**\n` +
+        let content = `🛒 **New Manual Order!**\n` +
             `- **Order ID:** #${order.id}\n` +
             `- **Player IGN:** \`${order.ign}\`\n` +
             `- **Discord:** \`${order.discordUser}\`\n` +
             `- **Payment Method:** ${order.paymentMethod}\n` +
-            `- **Total:** $${Number(order.total).toFixed(2)}\n` +
-            `- **Date:** <t:${Math.floor(new Date(order.date).getTime() / 1000)}:F>\n\n` +
+            `- **Total:** $${Number(order.total).toFixed(2)}\n\n` +
             `**Items:**\n${order.items.map(item => `• ${item.title} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
+
+        let files = [];
+        if (order.imageProof && order.imageProof.startsWith('data:image/')) {
+            const match = order.imageProof.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/i);
+            if (match) {
+                const buffer = Buffer.from(match[2], 'base64');
+                files.push({ attachment: buffer, name: `proof_${order.id}.${match[1]}` });
+            }
+        }
+
+        // لو مفيش صور، نبعت رسالة عادية
+        if (files.length === 0) {
+            const response = await fetch(DISCORD_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            });
+            if (!response.ok) {
+                console.error(`[WEBHOOK] Failed to send. Status: ${response.status}`);
+                return null;
+            }
+            return null; // مفيش رابط صورة
+        }
+
+        // لو في صورة، نبعتها كـ attachment وناخد الرابط
+        const formData = new FormData();
+        formData.append('payload_json', JSON.stringify({ content }));
+        files.forEach((file, index) => {
+            formData.append(`file${index}`, new Blob([file.attachment]), file.name);
+        });
 
         const response = await fetch(DISCORD_WEBHOOK_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content })
+            body: formData
         });
 
         if (!response.ok) {
-            console.error(`[WEBHOOK] Failed to send. Status: ${response.status}.`);
-        } else {
-            console.log(`[WEBHOOK] Order ${order.id} sent to Discord successfully.`);
+            console.error(`[WEBHOOK] Failed to send with image. Status: ${response.status}`);
+            return null;
         }
+
+        const data = await response.json();
+        const imageUrl = data?.attachments?.[0]?.url || null;
+        console.log(`[WEBHOOK] Order ${order.id} sent to Discord. Image URL: ${imageUrl ? 'YES' : 'NO'}`);
+        
+        return imageUrl;
+
     } catch (error) {
         console.error('[WEBHOOK] Error sending to Discord:', error.message);
+        return null;
     }
 }
 
@@ -257,6 +295,10 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
         const cart = validateAndBuildCart(items);
         const total = calculateDiscountedTotal(cart.subtotal, couponCode);
         
+        // نبعت الديسكورد الأول (عشان ناخد الرابط)
+        const webhookPayload = { ...order, items: cart.items, imageProof }; // order مؤقت
+        const imageUrl = await sendDiscordWebhook(webhookPayload);
+
         const order = { 
             id: createServerOrderId(), 
             ign: ign.trim(), 
@@ -269,11 +311,10 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             items: cart.items, 
             date: new Date().toISOString(), 
             status: 'pending',
-            imageProof: imageProof // بنحفظ الصورة
+            imageUrl: imageUrl // بنحفظ الرابط بس
         };
         
         await addOrder(order);
-        await sendDiscordWebhook(order, imageProof);
         
         return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
     } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
@@ -523,8 +564,8 @@ function renderOrders() {
     
     // زرار الصورة
     var proofHtml = '—';
-    if (o.imageProof) {
-      proofHtml = '<button class="btn-action btn-image" onclick="window.open(this.dataset.img, \'_blank\')" data-img="' + escapeHtml(o.imageProof) + '">View Proof</button>';
+    if (o.imageUrl) {
+      proofHtml = '<a href="' + escapeHtml(o.imageUrl) + '" target="_blank" class="btn-action btn-image">View Proof</a>';
     }
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
@@ -656,11 +697,11 @@ resetTimers();
 app.get('/admin', adminAuth, (req, res) => { res.set('Content-Type', 'text/html; charset=utf-8'); res.send(ADMIN_HTML); });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] Express listening on 0.0.0.0:${PORT}`);
+    console.log(`[SERVER] Express listening on ${PORT}`);
     initDatabase();
 });
 
-process.on('SIGTERM', () => console.log('[SHUTDOWN] Received SIGTERM. Ignoring...'));
-process.on('SIGINT', () => console.log('[SHUTDOWN] Received SIGINT. Ignoring...'));
+process.on('SIGTERM', () => console.log('[SHUTDOWN] Ignoring...'));
+process.on('SIGINT', () => console.log('[SHUTDOWN] Ignoring...'));
 process.on('unhandledRejection', (reason) => console.error('[UNHANDLED REJECTION]', reason));
 process.on('uncaughtException', (error) => console.error('[UNCAUGHT EXCEPTION]', error));
