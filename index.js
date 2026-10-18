@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v13 (Full + Token Debug)
+   NashmiMC Store Bot — Production Build v14 (Anti-Crash + Full)
    ========================================================= */
 
 'use strict';
@@ -391,6 +391,9 @@ app.set('trust proxy', 1);
 
 app.use(express.json({ limit: '12mb' }));
 app.use(express.urlencoded({ limit: '12mb', extended: true }));
+
+// مسار وهمي عشان Render يفتكره شغال وميقتلوش
+app.get('/', (req, res) => res.send('Bot is running!'));
 
 app.use((req, res, next) => {
     if (FRONTEND_URL) {
