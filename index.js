@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + Anti-RateLimit)
+   NashmiMC Store — Webhook Only (Full Admin + Images)
    ========================================================= */
 
 'use strict';
@@ -56,7 +56,9 @@ async function initDatabase() {
                 id VARCHAR(64) PRIMARY KEY, ign VARCHAR(16) NOT NULL, discord_user VARCHAR(64) NOT NULL,
                 payment_method VARCHAR(16) NOT NULL, payment_reference VARCHAR(255), subtotal NUMERIC(10, 2) NOT NULL,
                 total NUMERIC(10, 2) NOT NULL, coupon_code VARCHAR(32), items JSONB NOT NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                status VARCHAR(32) NOT NULL DEFAULT 'pending', 
+                image_proof TEXT, 
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
         dbReady = true;
@@ -70,7 +72,7 @@ function rowToOrder(row) {
     return {
         id: row.id, ign: row.ign, discordUser: row.discord_user, paymentMethod: row.payment_method,
         paymentReference: row.payment_reference, subtotal: Number(row.subtotal), total: Number(row.total),
-        couponCode: row.coupon_code, items: row.items, status: row.status,
+        couponCode: row.coupon_code, items: row.items, status: row.status, imageProof: row.image_proof,
         date: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at)
     };
 }
@@ -79,10 +81,10 @@ async function addOrder(order) {
     if (!dbReady) return false;
     try {
         await db.query(
-            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status, image_proof) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [order.id, order.ign, order.discordUser, order.paymentMethod, order.paymentReference || null,
-             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status]
+             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status, order.imageProof || null]
         );
         return true;
     } catch (err) { console.error('[DB] addOrder failed:', err.message); return false; }
@@ -135,17 +137,6 @@ function isValidIgn(ign) { return typeof ign === 'string' && /^[A-Za-z0-9_]{1,16
 function isValidDiscordUser(value) { return typeof value === 'string' && /^[a-zA-Z0-9._]{2,32}(#\d{4})?$/.test(value.trim()); }
 function isValidCoupon(code) { return typeof code === 'string' && code.trim().toUpperCase() === VALID_COUPON; }
 function calculateDiscountedTotal(subtotal, couponCode) { const discount = isValidCoupon(couponCode) ? COUPON_DISCOUNT : 0; return roundMoney(subtotal * (1 - discount)); }
-
-function sanitizeForDiscord(value, maxLength = 300) {
-    if (value == null) return '';
-    let s = String(value);
-    s = s.replace(/[\\`*_{}[\]()#+\-.!|>~]/g, '\\$&');
-    s = s.replace(/@(everyone|here|&)/g, '@\u200b$1');
-    s = s.replace(/[\r\n]+/g, ' ');
-    return s.substring(0, maxLength);
-}
-
-function formatDiscordTimestamp(isoString) { try { return `<t:${Math.floor(new Date(isoString).getTime() / 1000)}:F>`; } catch (_) { return 'Unknown'; } }
 
 function parseCustomRankItem(item) {
     if (!item || typeof item.title !== 'string') return null;
@@ -201,21 +192,18 @@ async function sendDiscordWebhook(order, imageProof = null) {
         console.warn('[WEBHOOK] DISCORD_WEBHOOK_URL is not set.');
         return;
     }
-    
-    // Anti-Rate Limit: استنى شوية قبل الإرسال
-    await new Promise(resolve => setTimeout(resolve, 2000));
 
     try {
         console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
         
         const content = `🛒 **New Manual Order!**\n` +
             `- **Order ID:** #${order.id}\n` +
-            `- **Player IGN:** \`${sanitizeForDiscord(order.ign, 32)}\`\n` +
-            `- **Discord:** \`${sanitizeForDiscord(order.discordUser, 64)}\`\n` +
-            `- **Payment Method:** ${sanitizeForDiscord(order.paymentMethod, 32)}\n` +
+            `- **Player IGN:** \`${order.ign}\`\n` +
+            `- **Discord:** \`${order.discordUser}\`\n` +
+            `- **Payment Method:** ${order.paymentMethod}\n` +
             `- **Total:** $${Number(order.total).toFixed(2)}\n` +
-            `- **Date:** ${formatDiscordTimestamp(order.date)}\n\n` +
-            `**Items:**\n${order.items.map(item => `• ${sanitizeForDiscord(item.title, 200)} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
+            `- **Date:** <t:${Math.floor(new Date(order.date).getTime() / 1000)}:F>\n\n` +
+            `**Items:**\n${order.items.map(item => `• ${item.title} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
 
         const response = await fetch(DISCORD_WEBHOOK_URL, {
             method: 'POST',
@@ -224,8 +212,7 @@ async function sendDiscordWebhook(order, imageProof = null) {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            console.error(`[WEBHOOK] Failed to send. Status: ${response.status}. Response: ${errText}`);
+            console.error(`[WEBHOOK] Failed to send. Status: ${response.status}.`);
         } else {
             console.log(`[WEBHOOK] Order ${order.id} sent to Discord successfully.`);
         }
@@ -281,7 +268,8 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
             items: cart.items, 
             date: new Date().toISOString(), 
-            status: 'pending' 
+            status: 'pending',
+            imageProof: imageProof // بنحفظ الصورة
         };
         
         await addOrder(order);
@@ -367,6 +355,8 @@ const ADMIN_HTML = `<!DOCTYPE html>
   .btn-reset { background:#6366f1; color:#fff; }
   .btn-reset:hover { background:#4f46e5; }
   .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
+  .btn-image { background:#3b82f6; color:#fff; }
+  .btn-image:hover { background:#2563eb; }
   .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
   .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
   .toast.show { transform:translateY(0); opacity:1; }
@@ -429,13 +419,14 @@ const ADMIN_HTML = `<!DOCTYPE html>
           <th>Method</th>
           <th>Items</th>
           <th>Total</th>
+          <th>Proof</th>
           <th>Status</th>
           <th>Date</th>
           <th>Actions</th>
         </tr>
       </thead>
       <tbody id="ordersTbody">
-        <tr><td colspan="8" class="empty-state">Loading...</td></tr>
+        <tr><td colspan="9" class="empty-state">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -520,7 +511,7 @@ function renderOrders() {
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No orders match your filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No orders match your filters.</td></tr>';
     return;
   }
 
@@ -529,6 +520,12 @@ function renderOrders() {
     var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
     var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
     var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
+    
+    // زرار الصورة
+    var proofHtml = '—';
+    if (o.imageProof) {
+      proofHtml = '<button class="btn-action btn-image" onclick="window.open(this.dataset.img, \'_blank\')" data-img="' + escapeHtml(o.imageProof) + '">View Proof</button>';
+    }
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
       '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
@@ -536,6 +533,7 @@ function renderOrders() {
       '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
       '<td>' + itemsStr + '</td>' +
       '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
+      '<td>' + proofHtml + '</td>' +
       '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
       '<td>' + escapeHtml(dateStr) + '</td>' +
       '<td><div class="actions-cell">' +
