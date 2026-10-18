@@ -10,12 +10,18 @@ const { Pool } = require('pg');
 
 const app = express();
 
+/* =========================================================
+   CONFIG
+   ========================================================= */
 const PORT = Number(process.env.PORT) || 10000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
 
+/* =========================================================
+   PRODUCT CATALOG
+   ========================================================= */
 const PRODUCT_CATALOG = {
     'VIP Rank': 3.99, 'MVP Rank': 9.99, 'MVP+ Rank': 17.99, 'NASHMI Rank': 29.99, 'NASHMI+ Rank': 59.99,
     '100k SMP Money': 0.99, '300k SMP Money': 2.49, '500k SMP Money': 4.99, '1M SMP Money': 9.99, '3M SMP Money': 24.99, '5M SMP Money': 49.99, '10M SMP Money': 74.99,
@@ -27,6 +33,9 @@ const ALLOWED_KEY_PRODUCTS = ['DOOM key', 'MAGMA Key', 'MYTHIC Key', 'Mecha Key'
 const VALID_COUPON = 'NASHMI2026';
 const COUPON_DISCOUNT = 0.15;
 
+/* =========================================================
+   POSTGRESQL POOL
+   ========================================================= */
 let db = null;
 let dbReady = false;
 
@@ -197,6 +206,7 @@ async function sendDiscordWebhook(order, imageProof = null) {
             `- **Order ID:** #${order.id}\n` +
             `- **Player IGN:** \`${sanitizeForDiscord(order.ign, 32)}\`\n` +
             `- **Discord:** \`${sanitizeForDiscord(order.discordUser, 64)}\`\n` +
+            `- **Payment Method:** ${sanitizeForDiscord(order.paymentMethod, 32)}\n` +
             `- **Total:** $${Number(order.total).toFixed(2)}\n` +
             `- **Date:** ${formatDiscordTimestamp(order.date)}\n\n` +
             `**Items:**\n${order.items.map(item => `• ${sanitizeForDiscord(item.title, 200)} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
@@ -244,12 +254,32 @@ app.get('/api/stats', trackingLimiter, async (req, res) => res.json(await getSta
 app.post('/api/new-order', orderLimiter, async (req, res) => {
     try {
         const { ign, discordUser, paymentMethod, items, couponCode, imageProof } = req.body || {};
-        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser) || String(paymentMethod || '').toUpperCase() !== 'CRYPTO' || typeof imageProof !== 'string') return res.status(400).json({ success: false, error: 'Invalid data.' });
+        
+        const method = String(paymentMethod || '').toUpperCase();
+        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser) || (method !== 'CRYPTO' && method !== 'PAYPAL') || typeof imageProof !== 'string') {
+            return res.status(400).json({ success: false, error: 'Invalid data.' });
+        }
+
         const cart = validateAndBuildCart(items);
         const total = calculateDiscountedTotal(cart.subtotal, couponCode);
-        const order = { id: createServerOrderId(), ign: ign.trim(), discordUser: normalizeText(discordUser, 100), paymentMethod: 'CRYPTO', paymentReference: 'Manual Crypto', subtotal: cart.subtotal, total, couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, items: cart.items, date: new Date().toISOString(), status: 'pending' };
+        
+        const order = { 
+            id: createServerOrderId(), 
+            ign: ign.trim(), 
+            discordUser: normalizeText(discordUser, 100), 
+            paymentMethod: method, 
+            paymentReference: 'Manual Payment', 
+            subtotal: cart.subtotal, 
+            total, 
+            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
+            items: cart.items, 
+            date: new Date().toISOString(), 
+            status: 'pending' 
+        };
+        
         await addOrder(order);
         await sendDiscordWebhook(order, imageProof);
+        
         return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
     } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
 });
