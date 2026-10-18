@@ -1,9 +1,11 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10.6 (Final & Fixed)
+   NashmiMC Store Bot — Production Build v10.7 (Final & Fixed)
    Changes:
    - Fixed syntax error in createDiscordOrder.
    - Added fallback in capture-order.
    - Added trust proxy for Render (fixes express-rate-limit crash).
+   - Removed shutdown function to prevent SIGTERM kills on Render.
+   - Added error logging for client.login.
    ========================================================= */
 
 'use strict';
@@ -1972,20 +1974,20 @@ if (!process.env.DISCORD_TOKEN) {
     process.exit(1);
 }
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch(error => {
+    console.error('[FATAL] Bot login failed:', error.message);
+});
 
 /* =========================================================
    GRACEFUL SHUTDOWN
    ========================================================= */
-async function shutdown(signal) {
-    console.log(`[SHUTDOWN] Received ${signal}. Cleaning up...`);
-    try { if (db) await db.end(); } catch (_) { /* ignore */ }
-    try { client.destroy(); } catch (_) { /* ignore */ }
-    process.exit(0);
-}
+process.on('SIGTERM', () => {
+    console.log('[SHUTDOWN] Received SIGTERM. Ignoring to keep bot alive...');
+});
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT', () => {
+    console.log('[SHUTDOWN] Received SIGINT. Ignoring to keep bot alive...');
+});
 
 process.on('unhandledRejection', (reason) => {
     console.error('[UNHANDLED REJECTION]', reason);
