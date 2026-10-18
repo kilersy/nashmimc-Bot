@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + Debug)
+   NashmiMC Store — Webhook Only (Full Admin + Anti-RateLimit)
    ========================================================= */
 
 'use strict';
@@ -18,9 +18,6 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
-
-// سطر تأكيد عشان نتأكد إن السيرفر شايف الويب هوك
-console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET (starts with ' + DISCORD_WEBHOOK_URL.substring(0, 30) + '...)' : 'MISSING!');
 
 /* =========================================================
    PRODUCT CATALOG
@@ -204,6 +201,10 @@ async function sendDiscordWebhook(order, imageProof = null) {
         console.warn('[WEBHOOK] DISCORD_WEBHOOK_URL is not set.');
         return;
     }
+    
+    // Anti-Rate Limit: استنى شوية قبل الإرسال
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
     try {
         console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
         
