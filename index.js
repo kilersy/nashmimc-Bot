@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v9 (Original Restored)
+   NashmiMC Store Bot — Production Build v13 (Full + Token Debug)
    ========================================================= */
 
 'use strict';
@@ -44,6 +44,9 @@ const PAYPAL_BASE_URL = PAYPAL_MODE === 'sandbox'
 
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
+
+// سطر التشخيص عشان نتأكد من التوكن
+console.log('TOKEN CHECK:', process.env.DISCORD_TOKEN ? 'Token is set (starts with ' + process.env.DISCORD_TOKEN.substring(0, 5) + ')' : 'Token is MISSING');
 
 /* =========================================================
    PRODUCT CATALOG
@@ -1977,7 +1980,6 @@ client.login(process.env.DISCORD_TOKEN).catch(error => {
 /* =========================================================
    GRACEFUL SHUTDOWN
    ========================================================= */
-// هنمنع السيرفر إنه يقفل لما Render يبعت إشارة
 process.on('SIGTERM', () => {
     console.log('[SHUTDOWN] Received SIGTERM. Ignoring to keep bot alive...');
 });
