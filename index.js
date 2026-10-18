@@ -7,7 +7,6 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 
@@ -141,6 +140,17 @@ function isValidDiscordUser(value) { return typeof value === 'string' && /^[a-zA
 function isValidCoupon(code) { return typeof code === 'string' && code.trim().toUpperCase() === VALID_COUPON; }
 function calculateDiscountedTotal(subtotal, couponCode) { const discount = isValidCoupon(couponCode) ? COUPON_DISCOUNT : 0; return roundMoney(subtotal * (1 - discount)); }
 
+function sanitizeForDiscord(value, maxLength = 300) {
+    if (value == null) return '';
+    let s = String(value);
+    s = s.replace(/[\\`*_{}[\]()#+\-.!|>~]/g, '\\$&');
+    s = s.replace(/@(everyone|here|&)/g, '@\u200b$1');
+    s = s.replace(/[\r\n]+/g, ' ');
+    return s.substring(0, maxLength);
+}
+
+function formatDiscordTimestamp(isoString) { try { return `<t:${Math.floor(new Date(isoString).getTime() / 1000)}:F>`; } catch (_) { return 'Unknown'; } }
+
 function parseCustomRankItem(item) {
     if (!item || typeof item.title !== 'string') return null;
     const titleMatch = item.title.trim().match(/^Custom Rank:\s*\[([A-Za-z0-9_-]{1,16})\]$/i);
@@ -216,7 +226,6 @@ async function sendDiscordWebhook(order) {
             }
         }
 
-        // لو مفيش صور، نبعت رسالة عادية
         if (files.length === 0) {
             const response = await fetch(DISCORD_WEBHOOK_URL, {
                 method: 'POST',
@@ -227,10 +236,9 @@ async function sendDiscordWebhook(order) {
                 console.error(`[WEBHOOK] Failed to send. Status: ${response.status}`);
                 return null;
             }
-            return null; // مفيش رابط صورة
+            return null;
         }
 
-        // لو في صورة، نبعتها كـ attachment وناخد الرابط
         const formData = new FormData();
         formData.append('payload_json', JSON.stringify({ content }));
         files.forEach((file, index) => {
@@ -295,10 +303,6 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
         const cart = validateAndBuildCart(items);
         const total = calculateDiscountedTotal(cart.subtotal, couponCode);
         
-        // نبعت الديسكورد الأول (عشان ناخد الرابط)
-        const webhookPayload = { ...order, items: cart.items, imageProof }; // order مؤقت
-        const imageUrl = await sendDiscordWebhook(webhookPayload);
-
         const order = { 
             id: createServerOrderId(), 
             ign: ign.trim(), 
@@ -310,9 +314,11 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
             items: cart.items, 
             date: new Date().toISOString(), 
-            status: 'pending',
-            imageUrl: imageUrl // بنحفظ الرابط بس
+            status: 'pending'
         };
+
+        const imageUrl = await sendDiscordWebhook({ ...order, imageProof });
+        order.imageUrl = imageUrl;
         
         await addOrder(order);
         
@@ -396,7 +402,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
   .btn-reset { background:#6366f1; color:#fff; }
   .btn-reset:hover { background:#4f46e5; }
   .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
-  .btn-image { background:#3b82f6; color:#fff; }
+  .btn-image { background:#3b82f6; color:#fff; text-decoration:none; display:inline-block; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; }
   .btn-image:hover { background:#2563eb; }
   .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
   .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
@@ -562,10 +568,9 @@ function renderOrders() {
     var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
     var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
     
-    // زرار الصورة
     var proofHtml = '—';
     if (o.imageUrl) {
-      proofHtml = '<a href="' + escapeHtml(o.imageUrl) + '" target="_blank" class="btn-action btn-image">View Proof</a>';
+      proofHtml = '<a href="' + escapeHtml(o.imageUrl) + '" target="_blank" class="btn-image">View Proof</a>';
     }
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
@@ -697,11 +702,11 @@ resetTimers();
 app.get('/admin', adminAuth, (req, res) => { res.set('Content-Type', 'text/html; charset=utf-8'); res.send(ADMIN_HTML); });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] Express listening on ${PORT}`);
+    console.log(`[SERVER] Express listening on 0.0.0.0:${PORT}`);
     initDatabase();
 });
 
-process.on('SIGTERM', () => console.log('[SHUTDOWN] Ignoring...'));
-process.on('SIGINT', () => console.log('[SHUTDOWN] Ignoring...'));
+process.on('SIGTERM', () => console.log('[SHUTDOWN] Received SIGTERM. Ignoring...'));
+process.on('SIGINT', () => console.log('[SHUTDOWN] Received SIGINT. Ignoring...'));
 process.on('unhandledRejection', (reason) => console.error('[UNHANDLED REJECTION]', reason));
 process.on('uncaughtException', (error) => console.error('[UNCAUGHT EXCEPTION]', error));
