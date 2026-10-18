@@ -1,712 +1,1315 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + Image URL)
+   NashmiMC Store — Frontend Script (Manual Payment)
    ========================================================= */
 
 'use strict';
 
-const express = require('express');
-const rateLimit = require('express-rate-limit');
-const { Pool } = require('pg');
+let cart = [];
+let selectedPaymentMethod = 'paypal';
+let discountPercent = 0;
+let appliedCouponName = '';
 
-const app = express();
+const API_URL = (() => {
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1') {
+        return 'http://localhost:3000';
+    }
+    return 'https://nashmimc-bot.onrender.com';
+})();
 
-/* =========================================================
-   CONFIG
-   ========================================================= */
-const PORT = Number(process.env.PORT) || 10000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const FRONTEND_URL = process.env.FRONTEND_URL || '';
-
-console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET' : 'MISSING!');
+const STORAGE_KEY = 'nashmi_orders';
+const MAX_HISTORY = 50;
+const MAX_PROOF_MB = 3;
 
 /* =========================================================
    PRODUCT CATALOG
    ========================================================= */
-const PRODUCT_CATALOG = {
-    'VIP Rank': 3.99, 'MVP Rank': 9.99, 'MVP+ Rank': 17.99, 'NASHMI Rank': 29.99, 'NASHMI+ Rank': 59.99,
-    '100k SMP Money': 0.99, '300k SMP Money': 2.49, '500k SMP Money': 4.99, '1M SMP Money': 9.99, '3M SMP Money': 24.99, '5M SMP Money': 49.99, '10M SMP Money': 74.99,
-    '100 SMP Gold': 0.99, '720 SMP Gold': 4.99, '1680 SMP Gold': 9.99, '3600 SMP Gold': 19.99, '6580 SMP Gold': 34.99, '10,000 SMP Gold': 49.99, '16,600 SMP Gold': 74.99, '22,400 SMP Gold': 99.99,
-    '100 Box Gold': 0.99, '720 Box Gold': 4.99, '1680 Box Gold': 9.99, '3600 Box Gold': 19.99, '6580 Box Gold': 34.99, '10,000 Box Gold': 49.99, '16,400 Box Gold': 74.99, '22,400 Box Gold': 99.99,
-    'DOOM key': 2.49, 'MAGMA Key': 4.99, 'MYTHIC Key': 9.99, 'Mecha Key': 5.00
-};
-const ALLOWED_KEY_PRODUCTS = ['DOOM key', 'MAGMA Key', 'MYTHIC Key', 'Mecha Key'];
-const VALID_COUPON = 'NASHMI2026';
-const COUPON_DISCOUNT = 0.15;
+const PRODUCTS = [
+    { id: 'vip_rank',      category: 'rank', title: 'VIP Rank',      price: 3.99,  image: 'vip.jpg',     nameClass: 'rank-vip',       infoTitle: 'VIP Rank Features',       infoText: 'Grants basic VIP prefix, /feed command, 3 homes limit, and access to VIP kit.' },
+    { id: 'mvp_rank',      category: 'rank', title: 'MVP Rank',      price: 9.99,  image: 'mvp.jpg',     nameClass: 'rank-mvp',       infoTitle: 'MVP Rank Features',       infoText: 'Grants MVP prefix, /heal, /feed, 5 homes limit, 2 virtual vaults, and MVP kit.' },
+    { id: 'mvp_plus_rank', category: 'rank', title: 'MVP+ Rank',     price: 17.99, image: 'mvp+.jpg',    nameClass: 'rank-mvpplus',   infoTitle: 'MVP+ Rank Features',      infoText: 'Grants MVP+ prefix, /fly in lobby, /heal, /feed, 8 homes limit, 4 virtual vaults, and exclusive kit.' },
+    { id: 'nashmi_rank',   category: 'rank', title: 'NASHMI Rank',   price: 29.99, image: 'nashmi.png',  nameClass: 'rank-nashmi',    infoTitle: 'NASHMI Rank Features',    infoText: 'Grants custom NASHMI prefix, /fly, /workbench, /anvil, 12 homes, 6 virtual vaults, and elite kit.' },
+    { id: 'nashmi_plus',   category: 'rank', title: 'NASHMI+ Rank',  price: 59.99, image: 'nashmi+.png', nameClass: 'rank-nashmiplus', infoTitle: 'NASHMI+ Rank Features',  infoText: 'Grants ultimate NASHMI+ prefix, all commands unlocked, /fly, /heal, /feed, /anvil, /ec, 20 homes, 10 virtual vaults, and legendary kit.' },
+
+    { id: 'smp_money_100k', category: 'smp_money', title: '100k SMP Money', price: 0.99,  image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_300k', category: 'smp_money', title: '300k SMP Money', price: 2.49,  image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_500k', category: 'smp_money', title: '500k SMP Money', price: 4.99,  image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_1m',   category: 'smp_money', title: '1M SMP Money',   price: 9.99,  image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_3m',   category: 'smp_money', title: '3M SMP Money',   price: 24.99, image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_5m',   category: 'smp_money', title: '5M SMP Money',   price: 49.99, image: 'money.jpg', nameClass: 'item-money' },
+    { id: 'smp_money_10m',  category: 'smp_money', title: '10M SMP Money',  price: 74.99, image: 'money.jpg', nameClass: 'item-money' },
+
+    { id: 'smp_gold_100',   category: 'smp_gold', title: '100 SMP Gold',     price: 0.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_720',   category: 'smp_gold', title: '720 SMP Gold',     price: 4.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_1680',  category: 'smp_gold', title: '1680 SMP Gold',    price: 9.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_3600',  category: 'smp_gold', title: '3600 SMP Gold',    price: 19.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_6580',  category: 'smp_gold', title: '6580 SMP Gold',    price: 34.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_10k',   category: 'smp_gold', title: '10,000 SMP Gold',  price: 49.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_16600', category: 'smp_gold', title: '16,600 SMP Gold',  price: 74.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'smp_gold_22400', category: 'smp_gold', title: '22,400 SMP Gold',  price: 99.99, image: 'gold.jpg', nameClass: 'item-gold' },
+
+    { id: 'smp_key_doom',   category: 'smp_key', title: 'DOOM key',   price: 2.49, image: 'doom_key.jpg',   nameClass: 'key-doom',   hasQty: true },
+    { id: 'smp_key_magma',  category: 'smp_key', title: 'MAGMA Key',  price: 4.99, image: 'magma_Key.jpg',  nameClass: 'key-magma',  hasQty: true },
+    { id: 'smp_key_mythic', category: 'smp_key', title: 'MYTHIC Key', price: 9.99, image: 'mythic_key.jpg', nameClass: 'key-mythic', hasQty: true },
+
+    { id: 'box_gold_100',   category: 'box_gold', title: '100 Box Gold',     price: 0.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_720',   category: 'box_gold', title: '720 Box Gold',     price: 4.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_1680',  category: 'box_gold', title: '1680 Box Gold',    price: 9.99,  image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_3600',  category: 'box_gold', title: '3600 Box Gold',    price: 19.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_6580',  category: 'box_gold', title: '6580 Box Gold',    price: 34.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_10k',   category: 'box_gold', title: '10,000 Box Gold',  price: 49.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_16400', category: 'box_gold', title: '16,400 Box Gold',  price: 74.99, image: 'gold.jpg', nameClass: 'item-gold' },
+    { id: 'box_gold_22400', category: 'box_gold', title: '22,400 Box Gold',  price: 99.99, image: 'gold.jpg', nameClass: 'item-gold' },
+
+    { id: 'box_key_mecha', category: 'box_key', title: 'Mecha Key', price: 5.00, image: 'Mecha.png', nameClass: 'key-mecha', hasQty: true }
+];
 
 /* =========================================================
-   POSTGRESQL POOL
+   INIT
    ========================================================= */
-let db = null;
-let dbReady = false;
+document.addEventListener('DOMContentLoaded', () => {
+    renderAllProducts();
+    initNavigation();
+    initDrawers();
+    initCartActions();
+    initCustomBuilder();
+    initCheckoutActions();
+    initTrackingActions();
+    initCopyButtons();
+    initEscapeAndOverlay();
+    initPaymentTabs();
+    initSubmitButton();
+    renderUserOrders();
 
-if (DATABASE_URL) {
-    db = new Pool({
-        connectionString: DATABASE_URL,
-        ssl: DATABASE_URL.includes('render.com') || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-        max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000
+    setInterval(syncOrdersFromServer, 60000);
+});
+
+/* =========================================================
+   PRODUCTS
+   ========================================================= */
+function renderAllProducts() {
+    document.querySelectorAll('.products-grid[data-category]').forEach(grid => {
+        const category = grid.dataset.category;
+        const items = PRODUCTS.filter(p => p.category === category);
+        grid.innerHTML = '';
+        items.forEach(product => {
+            grid.appendChild(buildProductCard(product));
+        });
     });
-    db.on('error', (err) => console.error('[DB] Unexpected pool error:', err.message));
 }
 
-async function initDatabase() {
-    if (!db) return;
-    try {
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS orders (
-                id VARCHAR(64) PRIMARY KEY, ign VARCHAR(16) NOT NULL, discord_user VARCHAR(64) NOT NULL,
-                payment_method VARCHAR(16) NOT NULL, payment_reference VARCHAR(255), subtotal NUMERIC(10, 2) NOT NULL,
-                total NUMERIC(10, 2) NOT NULL, coupon_code VARCHAR(32), items JSONB NOT NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'pending', 
-                image_url TEXT, 
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        `);
-        dbReady = true;
-        console.log('[DB] Connected and schema ready.');
-    } catch (err) {
-        console.error('[DB] Init failed:', err.message);
+function buildProductCard(product) {
+    const card = document.createElement('div');
+    card.className = 'product-card';
+
+    const frame = document.createElement('div');
+    frame.className = 'product-image-frame';
+    const img = document.createElement('img');
+    img.src = product.image;
+    img.alt = product.title;
+    img.loading = 'lazy';
+    frame.appendChild(img);
+
+    const info = document.createElement('div');
+    const nameRow = document.createElement('div');
+    nameRow.className = 'product-name-row';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'product-name ' + (product.nameClass || '');
+    nameEl.textContent = product.title;
+    nameRow.appendChild(nameEl);
+
+    if (product.infoTitle && product.infoText) {
+        const infoBtn = document.createElement('span');
+        infoBtn.className = 'rank-info-btn';
+        infoBtn.textContent = '?';
+        infoBtn.title = 'Rank Info';
+        infoBtn.addEventListener('click', () => {
+            showNotification(
+                '<i class="fa-solid fa-crown accent-icon"></i>',
+                product.infoTitle,
+                product.infoText
+            );
+        });
+        nameRow.appendChild(infoBtn);
+    }
+
+    info.appendChild(nameRow);
+
+    const priceEl = document.createElement('div');
+    priceEl.className = 'product-price';
+    priceEl.textContent = '$' + product.price.toFixed(2);
+    info.appendChild(priceEl);
+
+    let getQty = () => 1;
+
+    if (product.hasQty) {
+        const qtyRow = document.createElement('div');
+        qtyRow.className = 'qty-row';
+
+        const qtyLabel = document.createElement('label');
+        qtyLabel.className = 'qty-label';
+        qtyLabel.textContent = 'Quantity:';
+
+        const qtyInput = document.createElement('input');
+        qtyInput.type = 'number';
+        qtyInput.className = 'qty-input-box';
+        qtyInput.min = '1';
+        qtyInput.value = '1';
+
+        qtyInput.addEventListener('input', () => {
+            const q = Math.max(1, parseInt(qtyInput.value) || 1);
+            priceEl.textContent = '$' + (product.price * q).toFixed(2);
+        });
+
+        qtyRow.appendChild(qtyLabel);
+        qtyRow.appendChild(qtyInput);
+        info.appendChild(qtyRow);
+
+        getQty = () => Math.max(1, parseInt(qtyInput.value) || 1);
+    }
+
+    card.appendChild(frame);
+    card.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'card-actions-row';
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn-cart-action';
+    addBtn.textContent = 'Add to Cart';
+    addBtn.addEventListener('click', () => addProductToCart(product, getQty()));
+
+    const buyBtn = document.createElement('button');
+    buyBtn.type = 'button';
+    buyBtn.className = 'btn-buynow-action';
+    buyBtn.textContent = 'Buy Now';
+    buyBtn.addEventListener('click', () => {
+        addProductToCart(product, getQty());
+        openCheckoutModal();
+    });
+
+    actions.appendChild(addBtn);
+    actions.appendChild(buyBtn);
+    card.appendChild(actions);
+
+    return card;
+}
+
+function addProductToCart(product, qty) {
+    const safeQty = Math.max(1, parseInt(qty) || 1);
+    const title = safeQty > 1 ? `${safeQty}x ${product.title}` : product.title;
+    const totalPrice = Number((product.price * safeQty).toFixed(2));
+
+    cart.push({ title, price: totalPrice });
+    updateCartUI();
+
+    showNotification(
+        '<i class="fa-solid fa-cart-plus"></i>',
+        'Added to Cart',
+        `${escapeHtml(title)} has been added to your cart.`
+    );
+}
+
+/* =========================================================
+   NAVIGATION
+   ========================================================= */
+function initNavigation() {
+    document.querySelectorAll('.nav-item[data-section]').forEach(item => {
+        item.addEventListener('click', () => switchSection(item.dataset.section));
+    });
+
+    document.querySelectorAll('.drawer-links a[data-section]').forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            switchSection(link.dataset.section);
+            closeDrawer(document.getElementById('sideDrawer'));
+        });
+    });
+
+    document.querySelectorAll('.dropdown-item[data-section]').forEach(item => {
+        item.addEventListener('click', (e) => {
+            e.preventDefault();
+            switchSection(item.dataset.section);
+            closeAllDropdowns();
+        });
+    });
+
+    initDropdowns();
+}
+
+function initDropdowns() {
+    const smpBtn = document.getElementById('smpNavBtn');
+    const smpDropdown = document.getElementById('smpDropdown');
+    const boxBtn = document.getElementById('boxNavBtn');
+    const boxDropdown = document.getElementById('boxDropdown');
+
+    if (smpBtn && smpDropdown) {
+        smpBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (boxDropdown) boxDropdown.classList.remove('show');
+            smpDropdown.classList.toggle('show');
+        });
+    }
+
+    if (boxBtn && boxDropdown) {
+        boxBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (smpDropdown) smpDropdown.classList.remove('show');
+            boxDropdown.classList.toggle('show');
+        });
+    }
+
+    document.addEventListener('click', closeAllDropdowns);
+}
+
+function closeAllDropdowns() {
+    document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+}
+
+function switchSection(sectionId) {
+    document.querySelectorAll('.store-section').forEach(sec => sec.classList.remove('active'));
+    const target = document.getElementById(sectionId);
+    if (target) {
+        target.classList.add('active');
+        window.scrollTo({ top: 300, behavior: 'smooth' });
     }
 }
 
-function rowToOrder(row) {
+/* =========================================================
+   DRAWERS
+   ========================================================= */
+function initDrawers() {
+    document.getElementById('cartToggleBtn')?.addEventListener('click', () => {
+        document.getElementById('cartDrawer')?.classList.toggle('active');
+    });
+    document.getElementById('cartCloseBtn')?.addEventListener('click', () => {
+        document.getElementById('cartDrawer')?.classList.remove('active');
+    });
+    document.getElementById('navToggleBtn')?.addEventListener('click', () => {
+        document.getElementById('sideDrawer')?.classList.toggle('active');
+    });
+    document.getElementById('navCloseBtn')?.addEventListener('click', () => {
+        document.getElementById('sideDrawer')?.classList.remove('active');
+    });
+}
+
+function closeDrawer(el) {
+    if (el) el.classList.remove('active');
+}
+
+/* =========================================================
+   CART
+   ========================================================= */
+function initCartActions() {
+    document.getElementById('clearCartBtn')?.addEventListener('click', clearCart);
+    document.getElementById('couponApplyBtn')?.addEventListener('click', applyCoupon);
+    document.getElementById('checkoutBtn')?.addEventListener('click', openCheckoutModal);
+}
+
+function clearCart() {
+    if (cart.length === 0) {
+        showNotification('<i class="fa-solid fa-circle-exclamation"></i>', 'Empty Cart', 'Your cart is already empty.');
+        return;
+    }
+
+    showConfirmNotification(
+        '<i class="fa-solid fa-trash"></i>',
+        'Clear Cart?',
+        'This will remove all items from your cart. The coupon will remain applied.',
+        () => {
+            cart = [];
+            updateCartUI();
+            showNotification('<i class="fa-solid fa-check"></i>', 'Cart Cleared', 'All items have been removed.');
+        }
+    );
+}
+
+function updateCartUI() {
+    const container = document.getElementById('cartItemsContainer');
+    const countEl = document.getElementById('cart-count');
+    const totalEl = document.getElementById('cartTotalDisplay');
+    if (!container || !countEl || !totalEl) return;
+
+    container.innerHTML = '';
+    countEl.textContent = String(cart.length);
+
+    let subtotal = 0;
+
+    cart.forEach((item, index) => {
+        const itemPrice = Number(item.price) || 0;
+        subtotal += itemPrice;
+
+        const itemCard = document.createElement('div');
+        itemCard.className = 'cart-item-card';
+
+        const info = document.createElement('div');
+        info.className = 'cart-item-info';
+
+        const titleEl = document.createElement('span');
+        titleEl.className = 'cart-item-title';
+        titleEl.textContent = item.title;
+
+        const priceEl = document.createElement('span');
+        priceEl.className = 'cart-item-price';
+        priceEl.textContent = '$' + itemPrice.toFixed(2);
+
+        info.appendChild(titleEl);
+        info.appendChild(priceEl);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'cart-item-remove';
+        removeBtn.setAttribute('aria-label', 'Remove item');
+        removeBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        removeBtn.addEventListener('click', () => removeFromCart(index));
+
+        itemCard.appendChild(info);
+        itemCard.appendChild(removeBtn);
+        container.appendChild(itemCard);
+    });
+
+    const finalTotal = subtotal * (1 - discountPercent / 100);
+    totalEl.textContent = '$' + finalTotal.toFixed(2);
+}
+
+function removeFromCart(index) {
+    if (index < 0 || index >= cart.length) return;
+    cart.splice(index, 1);
+    updateCartUI();
+}
+
+function applyCoupon() {
+    const codeInput = document.getElementById('couponCodeInput');
+    const msg = document.getElementById('couponMsg');
+    if (!codeInput || !msg) return;
+
+    const code = (codeInput.value || '').trim().toUpperCase();
+
+    if (code === 'NASHMI2026') {
+        discountPercent = 15;
+        appliedCouponName = code;
+        msg.style.color = 'var(--success)';
+        msg.textContent = 'Coupon NASHMI2026 applied! (15% OFF)';
+    } else {
+        discountPercent = 0;
+        appliedCouponName = '';
+        msg.style.color = 'var(--danger)';
+        msg.textContent = 'Invalid Coupon Code!';
+    }
+
+    updateCartUI();
+}
+
+/* =========================================================
+   CHECKOUT MODAL
+   ========================================================= */
+function initCheckoutActions() {
+    document.getElementById('checkoutCloseBtn')?.addEventListener('click', closeCheckoutModal);
+}
+
+function openCheckoutModal() {
+    if (cart.length === 0) {
+        showNotification('<i class="fa-solid fa-circle-exclamation"></i>', 'Empty Cart', 'Your shopping cart is empty.');
+        return;
+    }
+
+    const modal = document.getElementById('checkoutModal');
+    if (modal) modal.classList.add('open');
+
+    setPaymentMethod(selectedPaymentMethod);
+}
+
+function closeCheckoutModal() {
+    const modal = document.getElementById('checkoutModal');
+    if (modal) modal.classList.remove('open');
+}
+
+/* =========================================================
+   PAYMENT TABS
+   ========================================================= */
+function initPaymentTabs() {
+    document.getElementById('tabPaypal')?.addEventListener('click', () => setPaymentMethod('paypal'));
+    document.getElementById('tabCrypto')?.addEventListener('click', () => setPaymentMethod('crypto'));
+}
+
+function setPaymentMethod(method) {
+    selectedPaymentMethod = method === 'crypto' ? 'crypto' : 'paypal';
+
+    const tabPaypal = document.getElementById('tabPaypal');
+    const tabCrypto = document.getElementById('tabCrypto');
+    const paypalContainer = document.getElementById('paypalContainer');
+    const cryptoDetails = document.getElementById('cryptoDetails');
+    const proofContainer = document.getElementById('proofUploadContainer');
+
+    if (tabPaypal) tabPaypal.classList.toggle('active', selectedPaymentMethod === 'paypal');
+    if (tabCrypto) tabCrypto.classList.toggle('active', selectedPaymentMethod === 'crypto');
+    
+    if (paypalContainer) paypalContainer.style.display = selectedPaymentMethod === 'paypal' ? 'block' : 'none';
+    if (cryptoDetails) cryptoDetails.style.display = selectedPaymentMethod === 'crypto' ? 'block' : 'none';
+
+    // تعديل: رفع الصورة بيظهر دايماً (سواء باي بال أو كريبتو)
+    if (proofContainer) {
+        proofContainer.style.display = 'block'; 
+    }
+}
+
+/* =========================================================
+   SUBMIT (Manual Payment)
+   ========================================================= */
+function initSubmitButton() {
+    document.getElementById('submitBtn')?.addEventListener('click', () => processCheckoutWebhook('Manual Payment'));
+}
+
+async function processCheckoutWebhook(paymentReference) {
+    if (cart.length === 0) {
+        showNotification('<i class="fa-solid fa-circle-exclamation"></i>', 'Empty Cart', 'Your shopping cart is empty.');
+        return;
+    }
+
+    const customer = getCheckoutCustomer();
+    if (!customer) return;
+
+    let imageProof = null;
+    try {
+        imageProof = await readPaymentProof();
+    } catch (error) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Payment Proof Error', error.message);
+        return;
+    }
+
+    if (!imageProof) {
+        showNotification('<i class="fa-solid fa-image"></i>', 'Payment Proof Required', 'Please attach your payment proof image before submitting.');
+        return;
+    }
+
+    const orderId = makeClientOrderId();
+    const finalTotal = getCartFinalTotal().toFixed(2);
+
+    const orderData = {
+        orderId,
+        ign: customer.ign,
+        discordUser: customer.discordUser,
+        paymentMethod: selectedPaymentMethod.toUpperCase(),
+        paymentReference,
+        items: getServerCart(),
+        imageProof
+    };
+
+    try {
+        setCheckoutBusy(true, 'Submitting Order');
+
+        const result = await apiRequest('/api/new-order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(orderData)
+        });
+
+        if (!result || result.success !== true) {
+            throw new Error(result?.error || 'Server rejected the order.');
+        }
+
+        const serverOrderId = result.orderId || orderId;
+        const serverTotal = Number(result.total ?? finalTotal).toFixed(2);
+
+        finalizeOrderSuccess(serverOrderId, serverTotal);
+    } catch (error) {
+        showNotification('<i class="fa-solid fa-circle-exclamation"></i>', 'Order Failed', error.message || 'The order could not be sent to the store server.');
+    } finally {
+        setCheckoutBusy(false, 'Complete Payment & Submit Order');
+    }
+}
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+function getCheckoutCustomer() {
+    const ignInput = document.getElementById('checkoutIgnInput');
+    const discordInput = document.getElementById('checkoutDiscordInput');
+    const ign = (ignInput?.value || '').trim();
+    const discordUser = (discordInput?.value || '').trim();
+
+    if (!ign) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Minecraft Name Required', 'Please enter your Minecraft IGN.');
+        ignInput?.focus();
+        return null;
+    }
+
+    if (!/^[A-Za-z0-9_]{1,16}$/.test(ign)) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Invalid IGN', 'IGN must be 1-16 chars (letters, numbers, underscore only).');
+        ignInput?.focus();
+        return null;
+    }
+
+    if (!discordUser) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Discord Username Required', 'Please enter your Discord username.');
+        discordInput?.focus();
+        return null;
+    }
+
+    if (!/^[a-zA-Z0-9._]{2,32}(#\d{4})?$/.test(discordUser)) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Invalid Discord Username', 'Use 2-32 chars (letters, numbers, dot, underscore).');
+        discordInput?.focus();
+        return null;
+    }
+
+    return { ign, discordUser };
+}
+
+function getCartFinalTotal() {
+    const subtotal = cart.reduce((sum, item) => {
+        const price = Number(item.price);
+        return sum + (Number.isFinite(price) ? price : 0);
+    }, 0);
+    return Number((subtotal * (1 - discountPercent / 100)).toFixed(2));
+}
+
+function getServerCart() {
+    return cart.map(item => ({
+        title: String(item.title || '').trim(),
+        price: Number(Number(item.price || 0).toFixed(2)),
+        ...(item.details ? { details: String(item.details) } : {})
+    }));
+}
+
+function readPaymentProof() {
+    return new Promise((resolve, reject) => {
+        const proofInput = document.getElementById('checkoutProofImage');
+        const imageFile = proofInput?.files?.[0] || null;
+
+        if (!imageFile) {
+            resolve(null);
+            return;
+        }
+
+        const maxSizeBytes = MAX_PROOF_MB * 1024 * 1024;
+        if (imageFile.size > maxSizeBytes) {
+            reject(new Error(`Image too large. Max ${MAX_PROOF_MB} MB.`));
+            return;
+        }
+
+        if (!/^image\/(png|jpeg|jpg|webp)$/i.test(imageFile.type)) {
+            reject(new Error('Please upload a PNG, JPG, or WEBP image.'));
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => {
+                try {
+                    const MAX_DIM = 1600;
+                    let w = img.width;
+                    let h = img.height;
+
+                    if (w > MAX_DIM || h > MAX_DIM) {
+                        if (w > h) {
+                            h = Math.round(h * (MAX_DIM / w));
+                            w = MAX_DIM;
+                        } else {
+                            w = Math.round(w * (MAX_DIM / h));
+                            h = MAX_DIM;
+                        }
+                    }
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+
+                    const compressed = canvas.toDataURL('image/jpeg', 0.8);
+                    resolve(compressed);
+                } catch (err) {
+                    resolve(e.target.result);
+                }
+            };
+            img.onerror = () => resolve(e.target.result);
+            img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('Unable to read the image.'));
+        reader.readAsDataURL(imageFile);
+    });
+}
+
+function makeClientOrderId() {
+    const timestamp = Date.now().toString(36).toUpperCase();
+    const randomPart = Math.floor(1000 + Math.random() * 9000);
+    return `NASHMI-${timestamp}-${randomPart}`;
+}
+
+function setCheckoutBusy(isBusy, text = 'Complete Payment & Submit Order') {
+    const submitBtn = document.getElementById('submitBtn');
+    if (!submitBtn) return;
+    submitBtn.disabled = isBusy;
+    submitBtn.innerHTML = isBusy
+        ? '<i class="fa-solid fa-spinner fa-spin"></i> Processing...'
+        : `${text} <i class="fa-solid fa-paper-plane"></i>`;
+}
+
+/* =========================================================
+   API
+   ========================================================= */
+async function apiRequest(path, options = {}) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    try {
+        const response = await fetch(`${API_URL}${path}`, {
+            ...options,
+            headers: {
+                Accept: 'application/json',
+                ...(options.headers || {})
+            },
+            mode: 'cors',
+            signal: controller.signal
+        });
+
+        const contentType = response.headers.get('content-type') || '';
+        let data;
+
+        if (contentType.includes('application/json')) {
+            data = await response.json();
+        } else {
+            const text = await response.text();
+            data = text ? { message: text } : {};
+        }
+
+        if (!response.ok) {
+            throw new Error(data?.error || data?.message || `Server returned HTTP ${response.status}`);
+        }
+
+        return data;
+    } catch (error) {
+        if (error?.name === 'AbortError') {
+            throw new Error('The store server took too long to respond. Please try again.');
+        }
+        if (error instanceof TypeError) {
+            throw new Error('Could not connect to the store server. Check your connection.');
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+/* =========================================================
+   ORDER SUCCESS
+   ========================================================= */
+function finalizeOrderSuccess(orderId, finalTotal) {
+    saveOrderToHistory({
+        id: orderId,
+        date: new Date().toLocaleDateString(),
+        total: finalTotal,
+        status: 'pending',
+        items: [...cart]
+    });
+
+    closeCheckoutModal();
+    resetCart();
+
+    showOrderSuccessNotification(
+        orderId,
+        'Your order has been sent to Discord.<br>Execution time inside the server is within <strong>3 to 4 hours maximum</strong>.'
+    );
+
+    switchSection('tracking-section');
+}
+
+function resetCart() {
+    cart = [];
+    discountPercent = 0;
+    appliedCouponName = '';
+
+    const couponInput = document.getElementById('couponCodeInput');
+    const msg = document.getElementById('couponMsg');
+    const fileInput = document.getElementById('checkoutProofImage');
+    if (couponInput) couponInput.value = '';
+    if (msg) msg.textContent = '';
+    if (fileInput) fileInput.value = '';
+
+    updateCartUI();
+}
+
+function showOrderSuccessNotification(orderId, message) {
+    const icon = document.getElementById('notifIcon');
+    const titleEl = document.getElementById('notifTitle');
+    const msg = document.getElementById('notifMsg');
+    const modal = document.getElementById('notificationModal');
+    const actions = document.getElementById('notifActions');
+
+    if (icon) icon.innerHTML = '<i class="fa-solid fa-circle-check success-icon"></i>';
+    if (titleEl) titleEl.textContent = 'Order Submitted Successfully!';
+
+    if (msg) {
+        msg.innerHTML = '';
+        const strong = document.createElement('strong');
+        strong.className = 'order-id-display';
+        strong.textContent = orderId;
+        msg.appendChild(document.createTextNode('Your Order ID: '));
+        msg.appendChild(strong);
+        msg.appendChild(document.createElement('br'));
+        msg.appendChild(document.createElement('br'));
+        msg.insertAdjacentHTML('beforeend', message);
+    }
+
+    if (actions) {
+        actions.innerHTML = '';
+
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'btn-modal-ok';
+        copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i> Copy Order ID';
+        copyBtn.addEventListener('click', () => copyOrderId(orderId));
+
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'btn-modal-ok';
+        okBtn.textContent = 'OK';
+        okBtn.addEventListener('click', closeNotificationModal);
+
+        actions.appendChild(copyBtn);
+        actions.appendChild(okBtn);
+    }
+
+    if (modal) modal.classList.add('open');
+}
+
+function copyOrderId(orderId) {
+    navigator.clipboard.writeText(orderId).then(() => {
+        showNotification('<i class="fa-solid fa-copy"></i>', 'Copied', 'Order ID copied to clipboard!');
+    });
+}
+
+/* =========================================================
+   ORDER HISTORY
+   ========================================================= */
+function saveOrderToHistory(order) {
+    let history = [];
+    try {
+        history = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    } catch { history = []; }
+
+    history.unshift(order);
+    history = history.slice(0, MAX_HISTORY);
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+    renderUserOrders();
+}
+
+function normalizeStatus(status) {
+    if (!status) return 'pending';
+    const s = String(status).toLowerCase().trim();
+    if (s === 'approved' || s === 'مقبول') return 'approved';
+    if (s === 'rejected' || s === 'مرفوض') return 'rejected';
+    if (s === 'unknown') return 'unknown';
+    return 'pending';
+}
+
+function renderUserOrders() {
+    const container = document.getElementById('userOrdersContainer');
+    if (!container) return;
+
+    let history = [];
+    try {
+        history = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    } catch { history = []; }
+
+    container.innerHTML = '';
+
+    if (history.length === 0) {
+        const p = document.createElement('p');
+        p.className = 'no-orders-msg';
+        p.textContent = 'No active orders found on this device.';
+        container.appendChild(p);
+        return;
+    }
+
+    history.forEach(ord => {
+        const itemEl = document.createElement('div');
+        itemEl.className = 'order-history-item';
+
+        const left = document.createElement('div');
+
+        const idEl = document.createElement('strong');
+        idEl.className = 'order-history-id';
+        idEl.textContent = ord.id;
+
+        const meta = document.createElement('div');
+        meta.className = 'order-history-meta';
+        meta.textContent = `Date: ${ord.date || 'N/A'} | Total: $${ord.total ?? '0.00'}`;
+
+        left.appendChild(idEl);
+        left.appendChild(meta);
+
+        const badge = document.createElement('span');
+        const ns = normalizeStatus(ord.status);
+        let statusClass = 'status-pending';
+        let statusIcon = 'fa-clock';
+        let statusText = 'Pending';
+
+        if (ns === 'approved') {
+            statusClass = 'status-success';
+            statusIcon = 'fa-check';
+            statusText = 'Approved';
+        } else if (ns === 'rejected') {
+            statusClass = 'status-danger';
+            statusIcon = 'fa-xmark';
+            statusText = 'Rejected';
+        } else if (ns === 'unknown') {
+            statusClass = 'status-danger';
+            statusIcon = 'fa-question';
+            statusText = 'Not Found';
+        }
+
+        badge.className = `status-badge ${statusClass}`;
+        badge.innerHTML = `<i class="fa-solid ${statusIcon}"></i> ${statusText}`;
+
+        itemEl.appendChild(left);
+        itemEl.appendChild(badge);
+        container.appendChild(itemEl);
+    });
+}
+
+async function syncOrdersFromServer() {
+    let history = [];
+    try {
+        history = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    } catch { return; }
+
+    if (history.length === 0) return;
+
+    let updated = false;
+    const toRemove = [];
+
+    await Promise.all(history.map(async localOrd => {
+        try {
+            const srvOrd = await apiRequest(`/api/orders/${encodeURIComponent(localOrd.id)}`);
+
+            if (!srvOrd || !srvOrd.status) return;
+
+            const normalized = normalizeStatus(srvOrd.status);
+
+            if (normalized !== localOrd.status) {
+                localOrd.status = normalized;
+                updated = true;
+            }
+
+            if (srvOrd.total != null) {
+                const srvTotal = Number(srvOrd.total).toFixed(2);
+                if (String(localOrd.total) !== srvTotal) {
+                    localOrd.total = srvTotal;
+                    updated = true;
+                }
+            }
+        } catch (err) {
+            const msg = String(err && err.message || '').toLowerCase();
+            if (msg.includes('not found')) {
+                toRemove.push(localOrd.id);
+            }
+        }
+    }));
+
+    if (toRemove.length > 0) {
+        history = history.filter(o => !toRemove.includes(o.id));
+        updated = true;
+    }
+
+    if (updated) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+        renderUserOrders();
+    }
+}
+
+/* =========================================================
+   TRACKING
+   ========================================================= */
+function initTrackingActions() {
+    document.getElementById('trackBtn')?.addEventListener('click', trackOrder);
+    const input = document.getElementById('trackingInput');
+    if (input) {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') trackOrder();
+        });
+    }
+}
+
+async function trackOrder() {
+    const input = document.getElementById('trackingInput');
+    const resultBox = document.getElementById('trackingResultBox');
+    const resultText = document.getElementById('trackingResultText');
+    const value = (input?.value || '').trim();
+
+    if (!value) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Track Order', 'Please enter a valid Order ID.');
+        return;
+    }
+
+    if (resultBox) resultBox.style.display = 'block';
+    if (resultText) resultText.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Checking...';
+
+    try {
+        const found = await apiRequest(`/api/orders/${encodeURIComponent(value)}`);
+        if (!found || !found.id) throw new Error('Order not found.');
+
+        const items = Array.isArray(found.items) ? found.items : [];
+
+        if (resultText) {
+            resultText.innerHTML = '';
+
+            const appendLine = (label, val) => {
+                const strong = document.createElement('strong');
+                strong.textContent = label + ': ';
+                resultText.appendChild(strong);
+                resultText.appendChild(document.createTextNode(String(val)));
+                resultText.appendChild(document.createElement('br'));
+            };
+
+            appendLine('Order ID', found.id);
+            appendLine('Date', found.date || 'N/A');
+            appendLine('Total', '$' + Number(found.total || 0).toFixed(2));
+
+            const stStrong = document.createElement('strong');
+            stStrong.textContent = 'Status: ';
+            resultText.appendChild(stStrong);
+
+            const ns = normalizeStatus(found.status);
+            let statusLabel = 'Pending';
+            if (ns === 'approved') statusLabel = 'Approved';
+            else if (ns === 'rejected') statusLabel = 'Rejected';
+
+            const badge = document.createElement('span');
+            badge.className = 'status-badge';
+            badge.innerHTML = `<i class="fa-solid fa-info-circle"></i> ${escapeHtml(statusLabel)}`;
+            resultText.appendChild(badge);
+            resultText.appendChild(document.createElement('br'));
+            resultText.appendChild(document.createElement('br'));
+
+            const itemsStrong = document.createElement('strong');
+            itemsStrong.textContent = 'Items Included:';
+            resultText.appendChild(itemsStrong);
+            resultText.appendChild(document.createElement('br'));
+
+            if (items.length === 0) {
+                resultText.appendChild(document.createTextNode('No item details.'));
+            } else {
+                items.forEach(item => {
+                    const line = document.createElement('div');
+                    line.textContent = `• ${item.title || ''} ($${Number(item.price || 0).toFixed(2)})`;
+                    resultText.appendChild(line);
+                });
+            }
+        }
+
+        let history = [];
+        try { history = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { history = []; }
+
+        const existingIndex = history.findIndex(o => String(o.id).toUpperCase() === String(found.id).toUpperCase());
+
+        const compact = {
+            id: found.id,
+            date: found.date || new Date().toLocaleDateString(),
+            total: Number(found.total || 0).toFixed(2),
+            status: normalizeStatus(found.status),
+            items
+        };
+
+        if (existingIndex >= 0) history[existingIndex] = compact;
+        else history.unshift(compact);
+
+        history = history.slice(0, MAX_HISTORY);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+        renderUserOrders();
+    } catch (error) {
+        if (resultText) {
+            resultText.innerHTML = '';
+            const strong = document.createElement('strong');
+            strong.textContent = 'Order ID: ';
+            resultText.appendChild(strong);
+            resultText.appendChild(document.createTextNode(value));
+            resultText.appendChild(document.createElement('br'));
+            const st = document.createElement('strong');
+            st.textContent = 'Status: ';
+            resultText.appendChild(st);
+            resultText.appendChild(document.createTextNode('Not Found'));
+        }
+    }
+}
+
+/* =========================================================
+   COPY BUTTONS
+   ========================================================= */
+function initCopyButtons() {
+    document.querySelectorAll('[data-copy]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const value = btn.dataset.copy || '';
+            const label = btn.dataset.copyLabel || 'Value';
+            navigator.clipboard.writeText(value).then(() => {
+                showNotification(
+                    '<i class="fa-solid fa-copy"></i>',
+                    label + ' Copied',
+                    label + ' copied to clipboard!'
+                );
+            });
+        });
+    });
+}
+
+/* =========================================================
+   NOTIFICATION MODAL
+   ========================================================= */
+function showNotification(iconHtml, title, message) {
+    const icon = document.getElementById('notifIcon');
+    const titleEl = document.getElementById('notifTitle');
+    const msg = document.getElementById('notifMsg');
+    const modal = document.getElementById('notificationModal');
+    const actions = document.getElementById('notifActions');
+
+    if (icon) icon.innerHTML = iconHtml;
+    if (titleEl) titleEl.textContent = title;
+    if (msg) msg.textContent = message;
+
+    if (actions) {
+        actions.innerHTML = '';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'btn-modal-ok';
+        okBtn.textContent = 'OK';
+        okBtn.addEventListener('click', closeNotificationModal);
+        actions.appendChild(okBtn);
+    }
+
+    if (modal) modal.classList.add('open');
+}
+
+function showConfirmNotification(iconHtml, title, message, onConfirm) {
+    const icon = document.getElementById('notifIcon');
+    const titleEl = document.getElementById('notifTitle');
+    const msg = document.getElementById('notifMsg');
+    const modal = document.getElementById('notificationModal');
+    const actions = document.getElementById('notifActions');
+
+    if (icon) icon.innerHTML = iconHtml;
+    if (titleEl) titleEl.textContent = title;
+    if (msg) msg.textContent = message;
+
+    if (actions) {
+        actions.innerHTML = '';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'btn-clear-cart';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', closeNotificationModal);
+
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'btn-modal-ok';
+        okBtn.textContent = 'Confirm';
+        okBtn.addEventListener('click', () => {
+            closeNotificationModal();
+            onConfirm();
+        });
+
+        actions.appendChild(cancelBtn);
+        actions.appendChild(okBtn);
+    }
+
+    if (modal) modal.classList.add('open');
+}
+
+function closeNotificationModal() {
+    const modal = document.getElementById('notificationModal');
+    if (modal) modal.classList.remove('open');
+}
+
+/* =========================================================
+   ESCAPE + OVERLAY CLICK
+   ========================================================= */
+function initEscapeAndOverlay() {
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+
+        closeNotificationModal();
+        closeCheckoutModal();
+
+        document.getElementById('cartDrawer')?.classList.remove('active');
+        document.getElementById('sideDrawer')?.classList.remove('active');
+        closeAllDropdowns();
+    });
+
+    ['checkoutModal', 'notificationModal'].forEach(id => {
+        const overlay = document.getElementById(id);
+        if (!overlay) return;
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                overlay.classList.remove('open');
+            }
+        });
+    });
+}
+
+/* =========================================================
+   CUSTOM RANK BUILDER
+   ========================================================= */
+function initCustomBuilder() {
+    const ids = ['customName', 'customPv', 'customHomes', 'customEc', 'chkAnvil', 'chkTags', 'chkSafeRoom', 'chkColor', 'primaryRankColor', 'secondaryRankColor'];
+    ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.addEventListener('input', () => { updateCustomPreview(); calcCustomPrice(); });
+            el.addEventListener('change', () => { updateCustomPreview(); calcCustomPrice(); });
+        }
+    });
+
+    document.querySelectorAll('input[name="colorType"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const isGradient = radio.value === 'gradient' && radio.checked;
+            const secGroup = document.getElementById('secondaryColorGroup');
+            if (secGroup) secGroup.style.display = isGradient ? 'block' : 'none';
+            updateCustomPreview();
+        });
+    });
+
+    const chkColor = document.getElementById('chkColor');
+    if (chkColor) {
+        chkColor.addEventListener('change', () => {
+            const container = document.getElementById('colorOptionsContainer');
+            if (container) container.style.display = chkColor.checked ? 'block' : 'none';
+        });
+    }
+
+    document.getElementById('customAddBtn')?.addEventListener('click', () => addCustomToCart(false));
+    document.getElementById('customBuyBtn')?.addEventListener('click', () => addCustomToCart(true));
+
+    updateCustomPreview();
+    calcCustomPrice();
+}
+
+function updateCustomPreview() {
+    const nameInput = document.getElementById('customName');
+    const previewEl = document.getElementById('liveRankPreview');
+    const colorHex = document.getElementById('colorHexCodeDisplay');
+    const chkColor = document.getElementById('chkColor');
+
+    if (!previewEl) return;
+
+    const name = ((nameInput?.value || '').trim().toUpperCase() || 'KING').replace(/[^A-Z0-9_]/g, '').substring(0, 16);
+
+    if (!chkColor?.checked) {
+        previewEl.style.background = 'none';
+        previewEl.style.color = '#fbbf24';
+        previewEl.style.webkitBackgroundClip = 'initial';
+        previewEl.style.webkitTextFillColor = 'initial';
+        previewEl.textContent = `[${name}]`;
+        if (colorHex) colorHex.textContent = 'Color Styling: Default (#fbbf24)';
+        return;
+    }
+
+    const isGradient = document.querySelector('input[name="colorType"]:checked')?.value === 'gradient';
+    const pColor = document.getElementById('primaryRankColor')?.value || '#ffffff';
+    const sColor = document.getElementById('secondaryRankColor')?.value || '#ffffff';
+
+    if (isGradient) {
+        previewEl.style.background = `linear-gradient(90deg, ${pColor}, ${sColor})`;
+        previewEl.style.webkitBackgroundClip = 'text';
+        previewEl.style.webkitTextFillColor = 'transparent';
+        previewEl.textContent = `[${name}]`;
+        if (colorHex) colorHex.textContent = `Gradient HEX: ${pColor} > ${sColor}`;
+    } else {
+        previewEl.style.background = 'none';
+        previewEl.style.color = pColor;
+        previewEl.style.webkitBackgroundClip = 'initial';
+        previewEl.style.webkitTextFillColor = 'initial';
+        previewEl.textContent = `[${name}]`;
+        if (colorHex) colorHex.textContent = `Solid HEX Code: ${pColor}`;
+    }
+}
+
+function calcCustomPrice() {
+    let price = 5.00;
+
+    const pv = Math.min(10, Math.max(0, parseInt(document.getElementById('customPv')?.value) || 0));
+    const homes = Math.min(7, Math.max(2, parseInt(document.getElementById('customHomes')?.value) || 2));
+    const ecPrice = parseFloat(document.getElementById('customEc')?.value) || 0;
+
+    price += pv * 3.00;
+    if (homes > 2) price += (homes - 2) * 1.50;
+    price += ecPrice;
+
+    if (document.getElementById('chkAnvil')?.checked) price += 3.00;
+    if (document.getElementById('chkTags')?.checked) price += 4.00;
+    if (document.getElementById('chkSafeRoom')?.checked) price += 5.00;
+    if (document.getElementById('chkColor')?.checked) price += 3.00;
+
+    const display = document.getElementById('customPriceDisplay');
+    if (display) display.textContent = `$${price.toFixed(2)}`;
+
+    return Number(price.toFixed(2));
+}
+
+function getCustomRankDetails() {
+    const nameInput = document.getElementById('customName');
+    const rawName = ((nameInput?.value || '').trim().toUpperCase() || 'KING').replace(/[^A-Z0-9_]/g, '').substring(0, 16);
+
+    const pv = Math.min(10, Math.max(0, parseInt(document.getElementById('customPv')?.value) || 0));
+    const homes = Math.min(7, Math.max(2, parseInt(document.getElementById('customHomes')?.value) || 2));
+
+    const ecSelect = document.getElementById('customEc');
+    const ecText = ecSelect ? ecSelect.options[ecSelect.selectedIndex].text : 'None';
+
+    const anvil = document.getElementById('chkAnvil')?.checked ? 'Yes' : 'No';
+    const tags = document.getElementById('chkTags')?.checked ? 'Yes' : 'No';
+    const safeRoom = document.getElementById('chkSafeRoom')?.checked ? 'Yes' : 'No';
+    const hasColor = document.getElementById('chkColor')?.checked;
+
+    let colorInfo = 'Default Accent Color';
+
+    if (hasColor) {
+        const isGradient = document.querySelector('input[name="colorType"]:checked')?.value === 'gradient';
+        const pColor = document.getElementById('primaryRankColor')?.value || '#ffffff';
+        const sColor = document.getElementById('secondaryRankColor')?.value || '#ffffff';
+
+        if (isGradient) colorInfo = `Gradient (${pColor} to ${sColor})`;
+        else colorInfo = `Solid (${pColor})`;
+    }
+
     return {
-        id: row.id, ign: row.ign, discordUser: row.discord_user, paymentMethod: row.payment_method,
-        paymentReference: row.payment_reference, subtotal: Number(row.subtotal), total: Number(row.total),
-        couponCode: row.coupon_code, items: row.items, status: row.status, imageUrl: row.image_url,
-        date: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at)
+        name: rawName,
+        details: `Rank Name: [${rawName}] | Color: ${colorInfo} | PVs: ${pv} | Homes: ${homes} | EC: ${ecText} | Anvil: ${anvil} | Tags: ${tags} | SafeRoom: ${safeRoom}`
     };
 }
 
-async function addOrder(order) {
-    if (!dbReady) return false;
-    try {
-        await db.query(
-            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status, image_url) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [order.id, order.ign, order.discordUser, order.paymentMethod, order.paymentReference || null,
-             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status, order.imageUrl || null]
-        );
-        return true;
-    } catch (err) { console.error('[DB] addOrder failed:', err.message); return false; }
-}
+function addCustomToCart(goToCheckout) {
+    const rankObj = getCustomRankDetails();
+    const price = calcCustomPrice();
 
-async function findOrderById(id) {
-    if (!dbReady || !id) return null;
-    try {
-        const result = await db.query(`SELECT * FROM orders WHERE UPPER(id) = UPPER($1) LIMIT 1`, [String(id)]);
-        return result.rows.length === 0 ? null : rowToOrder(result.rows[0]);
-    } catch (err) { return null; }
-}
-
-async function updateOrderStatus(id, status) {
-    if (!dbReady) return false;
-    try { const result = await db.query(`UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`, [status, id]); return result.rowCount > 0; } catch (err) { return false; }
-}
-
-async function getStats() {
-    if (!dbReady) return { ok: false, error: 'DB not ready' };
-    try {
-        const countersResult = await db.query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status = 'pending')::int AS pending, COUNT(*) FILTER (WHERE status = 'approved')::int AS approved, COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected FROM orders`);
-        const revenueResult = await db.query(`SELECT COALESCE(SUM(total), 0)::numeric AS revenue FROM orders WHERE status = 'approved'`);
-        const recentResult = await db.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 100`);
-        return { ok: true, totalOrders: countersResult.rows[0].total, byStatus: { pending: countersResult.rows[0].pending, approved: countersResult.rows[0].approved, rejected: countersResult.rows[0].rejected }, totalRevenue: Number(revenueResult.rows[0].revenue), recentOrders: recentResult.rows.map(rowToOrder) };
-    } catch (err) { return { ok: false, error: err.message }; }
-}
-
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '12mb' }));
-app.use(express.urlencoded({ limit: '12mb', extended: true }));
-
-app.use((req, res, next) => {
-    if (FRONTEND_URL) { res.header('Access-Control-Allow-Origin', FRONTEND_URL); res.header('Vary', 'Origin'); } else { res.header('Access-Control-Allow-Origin', '*'); }
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-});
-
-const globalLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
-const orderLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
-const trackingLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false });
-app.use(globalLimiter);
-
-function roundMoney(v) { return Number(Number(v).toFixed(2)); }
-function createServerOrderId() { return 'NASHMI-' + Math.random().toString(36).substring(2, 8).toUpperCase() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase(); }
-function normalizeText(value, maxLength = 200) { return typeof value !== 'string' ? '' : value.trim().replace(/\s+/g, ' ').substring(0, maxLength); }
-function isValidIgn(ign) { return typeof ign === 'string' && /^[A-Za-z0-9_]{1,16}$/.test(ign.trim()); }
-function isValidDiscordUser(value) { return typeof value === 'string' && /^[a-zA-Z0-9._]{2,32}(#\d{4})?$/.test(value.trim()); }
-function isValidCoupon(code) { return typeof code === 'string' && code.trim().toUpperCase() === VALID_COUPON; }
-function calculateDiscountedTotal(subtotal, couponCode) { const discount = isValidCoupon(couponCode) ? COUPON_DISCOUNT : 0; return roundMoney(subtotal * (1 - discount)); }
-
-function sanitizeForDiscord(value, maxLength = 300) {
-    if (value == null) return '';
-    let s = String(value);
-    s = s.replace(/[\\`*_{}[\]()#+\-.!|>~]/g, '\\$&');
-    s = s.replace(/@(everyone|here|&)/g, '@\u200b$1');
-    s = s.replace(/[\r\n]+/g, ' ');
-    return s.substring(0, maxLength);
-}
-
-function formatDiscordTimestamp(isoString) { try { return `<t:${Math.floor(new Date(isoString).getTime() / 1000)}:F>`; } catch (_) { return 'Unknown'; } }
-
-function parseCustomRankItem(item) {
-    if (!item || typeof item.title !== 'string') return null;
-    const titleMatch = item.title.trim().match(/^Custom Rank:\s*\[([A-Za-z0-9_-]{1,16})\]$/i);
-    if (!titleMatch) return null;
-    const details = typeof item.details === 'string' ? item.details : '';
-    const pvMatch = details.match(/PVs:\s*(\d+)/i);
-    const homesMatch = details.match(/Homes:\s*(\d+)/i);
-    const ecMatch = details.match(/EC:\s*([^|]+)/i);
-    const anvilMatch = details.match(/Anvil:\s*(Yes|No)/i);
-    const tagsMatch = details.match(/Tags:\s*(Yes|No)/i);
-    const safeRoomMatch = details.match(/SafeRoom:\s*(Yes|No)/i);
-    const colorMatch = details.match(/Color:\s*([^|]+)/i);
-    if (!pvMatch || !homesMatch || !ecMatch || !anvilMatch || !tagsMatch || !safeRoomMatch || !colorMatch) return null;
-    const pv = Number(pvMatch[1]); const homes = Number(homesMatch[1]);
-    if (!Number.isInteger(pv) || pv < 0 || pv > 10 || !Number.isInteger(homes) || homes < 2 || homes > 7) return null;
-    const ecText = ecMatch[1].trim(); let ecPrice = 0;
-    if (ecText.toLowerCase().includes('normal enderchest')) ecPrice = 2;
-    else if (ecText.toLowerCase().includes('double enderchest')) ecPrice = 4;
-    const anvil = anvilMatch[1].toLowerCase() === 'yes'; const tags = tagsMatch[1].toLowerCase() === 'yes';
-    const safeRoom = safeRoomMatch[1].toLowerCase() === 'yes'; const colorText = colorMatch[1].trim();
-    const hasColor = !colorText.toLowerCase().includes('default accent color');
-    let price = 5 + (pv * 3) + (homes > 2 ? (homes - 2) * 1.5 : 0) + ecPrice;
-    if (anvil) price += 3; if (tags) price += 4; if (safeRoom) price += 5; if (hasColor) price += 3;
-    return { title: `Custom Rank: [${titleMatch[1].toUpperCase()}]`, price: roundMoney(price), details: `Rank Name: [${titleMatch[1].toUpperCase()}] | Color: ${colorText} | PVs: ${pv} | Homes: ${homes} | EC: ${ecText} | Anvil: ${anvil ? 'Yes' : 'No'} | Tags: ${tags ? 'Yes' : 'No'} | SafeRoom: ${safeRoom ? 'Yes' : 'No'}` };
-}
-
-function parseFixedProductItem(item) {
-    if (!item || typeof item.title !== 'string') return null;
-    const rawTitle = item.title.trim();
-    if (Object.prototype.hasOwnProperty.call(PRODUCT_CATALOG, rawTitle)) return { title: rawTitle, price: PRODUCT_CATALOG[rawTitle] };
-    const quantityMatch = rawTitle.match(/^(\d+)\s*x\s*(.+)$/i);
-    if (!quantityMatch) return null;
-    const quantity = Number(quantityMatch[1]); const productName = quantityMatch[2].trim();
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 1000 || !ALLOWED_KEY_PRODUCTS.includes(productName)) return null;
-    const unitPrice = PRODUCT_CATALOG[productName];
-    return { title: `${quantity}x ${productName}`, price: roundMoney(unitPrice * quantity), details: `Quantity: ${quantity} | Unit Price: $${unitPrice.toFixed(2)}` };
-}
-
-function validateAndBuildCart(items) {
-    if (!Array.isArray(items) || items.length < 1 || items.length > 50) throw new Error('Invalid cart.');
-    const validatedItems = [];
-    for (const item of items) {
-        const fixedItem = parseFixedProductItem(item); if (fixedItem) { validatedItems.push(fixedItem); continue; }
-        const customItem = parseCustomRankItem(item); if (customItem) { validatedItems.push(customItem); continue; }
-        throw new Error(`Invalid product: ${normalizeText(item?.title || 'Unknown')}`);
-    }
-    return { items: validatedItems, subtotal: roundMoney(validatedItems.reduce((sum, item) => sum + Number(item.price), 0)) };
-}
-
-async function sendDiscordWebhook(order) {
-    if (!DISCORD_WEBHOOK_URL) {
-        console.warn('[WEBHOOK] DISCORD_WEBHOOK_URL is not set.');
-        return null;
+    if (!rankObj.name || rankObj.name.length < 1) {
+        showNotification('<i class="fa-solid fa-triangle-exclamation"></i>', 'Rank Name Required', 'Please enter a custom rank name.');
+        return;
     }
 
-    try {
-        console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
-        
-        let content = `🛒 **New Manual Order!**\n` +
-            `- **Order ID:** #${order.id}\n` +
-            `- **Player IGN:** \`${order.ign}\`\n` +
-            `- **Discord:** \`${order.discordUser}\`\n` +
-            `- **Payment Method:** ${order.paymentMethod}\n` +
-            `- **Total:** $${Number(order.total).toFixed(2)}\n\n` +
-            `**Items:**\n${order.items.map(item => `• ${item.title} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
-
-        let files = [];
-        if (order.imageProof && order.imageProof.startsWith('data:image/')) {
-            const match = order.imageProof.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/i);
-            if (match) {
-                const buffer = Buffer.from(match[2], 'base64');
-                files.push({ attachment: buffer, name: `proof_${order.id}.${match[1]}` });
-            }
-        }
-
-        if (files.length === 0) {
-            const response = await fetch(DISCORD_WEBHOOK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content })
-            });
-            if (!response.ok) {
-                console.error(`[WEBHOOK] Failed to send. Status: ${response.status}`);
-                return null;
-            }
-            return null;
-        }
-
-        const formData = new FormData();
-        formData.append('payload_json', JSON.stringify({ content }));
-        files.forEach((file, index) => {
-            formData.append(`file${index}`, new Blob([file.attachment]), file.name);
-        });
-
-        const response = await fetch(DISCORD_WEBHOOK_URL, {
-            method: 'POST',
-            body: formData
-        });
-
-        if (!response.ok) {
-            console.error(`[WEBHOOK] Failed to send with image. Status: ${response.status}`);
-            return null;
-        }
-
-        const data = await response.json();
-        const imageUrl = data?.attachments?.[0]?.url || null;
-        console.log(`[WEBHOOK] Order ${order.id} sent to Discord. Image URL: ${imageUrl ? 'YES' : 'NO'}`);
-        
-        return imageUrl;
-
-    } catch (error) {
-        console.error('[WEBHOOK] Error sending to Discord:', error.message);
-        return null;
-    }
-}
-
-function adminAuth(req, res, next) {
-    if (!ADMIN_PASSWORD) return res.status(503).send('Admin password not configured.');
-    const authHeader = req.headers.authorization || '';
-    if (!authHeader.startsWith('Basic ')) {
-        res.set('WWW-Authenticate', 'Basic realm="NashmiMC Admin"');
-        return res.status(401).send('Authentication required.');
-    }
-    const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
-    const password = decoded.substring(decoded.indexOf(':') + 1);
-    if (password !== ADMIN_PASSWORD) {
-        res.set('WWW-Authenticate', 'Basic realm="NashmiMC Admin"');
-        return res.status(401).send('Invalid credentials.');
-    }
-    next();
-}
-
-app.get('/health', async (req, res) => {
-    let dbStatus = 'disabled';
-    if (db) { try { await db.query('SELECT 1'); dbStatus = 'connected'; } catch (err) { dbStatus = 'error'; } }
-    res.json({ ok: true, webhook: Boolean(DISCORD_WEBHOOK_URL), db: dbStatus });
-});
-
-app.get('/api/stats', trackingLimiter, async (req, res) => res.json(await getStats()));
-
-app.post('/api/new-order', orderLimiter, async (req, res) => {
-    try {
-        const { ign, discordUser, paymentMethod, items, couponCode, imageProof } = req.body || {};
-        
-        const method = String(paymentMethod || '').toUpperCase();
-        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser) || (method !== 'CRYPTO' && method !== 'PAYPAL') || typeof imageProof !== 'string') {
-            return res.status(400).json({ success: false, error: 'Invalid data.' });
-        }
-
-        const cart = validateAndBuildCart(items);
-        const total = calculateDiscountedTotal(cart.subtotal, couponCode);
-        
-        const order = { 
-            id: createServerOrderId(), 
-            ign: ign.trim(), 
-            discordUser: normalizeText(discordUser, 100), 
-            paymentMethod: method, 
-            paymentReference: 'Manual Payment', 
-            subtotal: cart.subtotal, 
-            total, 
-            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
-            items: cart.items, 
-            date: new Date().toISOString(), 
-            status: 'pending'
-        };
-
-        const imageUrl = await sendDiscordWebhook({ ...order, imageProof });
-        order.imageUrl = imageUrl;
-        
-        await addOrder(order);
-        
-        return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
-    } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
-});
-
-app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
-    const order = await findOrderById(normalizeText(req.params.orderId, 100).toUpperCase());
-    if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
-    return res.json({ success: true, id: order.id, date: order.date, total: order.total, status: order.status, items: order.items });
-});
-
-app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) => {
-    try {
-        const { orderId, action } = req.body || {};
-        if (!orderId || !['accept', 'reject', 'reset'].includes(action)) return res.status(400).json({ success: false, error: 'Invalid request.' });
-        const order = await findOrderById(orderId);
-        if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
-        const newStatus = action === 'accept' ? 'approved' : action === 'reject' ? 'rejected' : 'pending';
-        await updateOrderStatus(order.id, newStatus);
-        return res.json({ success: true, orderId: order.id, status: newStatus });
-    } catch (error) { return res.status(500).json({ success: false, error: 'Internal error.' }); }
-});
-
-const ADMIN_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NashmiMC Admin — Orders</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-  :root { --bg:#0a0e1a; --card:#131b2e; --card-hover:#1a2340; --border:#2d3654; --accent:#fbbf24; --text:#f1f5f9; --muted:#94a3b8; --success:#10b981; --danger:#ef4444; --warning:#f59e0b; }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'Inter',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:20px; }
-  .container { max-width:1500px; margin:0 auto; }
-  header { display:flex; justify-content:space-between; align-items:center; padding:20px 0; border-bottom:2px solid var(--border); margin-bottom:30px; flex-wrap:wrap; gap:15px; }
-  h1 { font-size:1.8rem; color:var(--accent); font-weight:800; letter-spacing:-0.5px; }
-  h1 span { color:var(--text); font-weight:400; font-size:0.95rem; margin-left:12px; }
-  .refresh-info { font-size:0.85rem; color:var(--muted); }
-  .refresh-info strong { color:var(--accent); }
-  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:15px; margin-bottom:30px; }
-  .stat-card { background:var(--card); border:2px solid var(--border); border-radius:14px; padding:22px; transition:all 0.2s; }
-  .stat-card:hover { border-color:var(--accent); transform:translateY(-2px); }
-  .stat-label { font-size:0.85rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px; font-weight:600; }
-  .stat-value { font-size:2.2rem; font-weight:800; color:var(--accent); }
-  .stat-value.green { color:var(--success); }
-  .stat-value.red { color:var(--danger); }
-  .stat-value.yellow { color:var(--warning); }
-  .search-bar { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
-  .search-bar input, .search-bar select { background:var(--card); border:2px solid var(--border); color:var(--text); padding:12px 16px; border-radius:10px; font-size:0.95rem; outline:none; font-family:inherit; }
-  .search-bar input { flex:1; min-width:200px; }
-  .search-bar input:focus, .search-bar select:focus { border-color:var(--accent); }
-  .search-bar button { background:var(--accent); color:var(--bg); border:none; padding:12px 22px; border-radius:10px; font-weight:700; cursor:pointer; transition:all 0.2s; }
-  .search-bar button:hover { transform:scale(1.03); }
-  .orders-table-wrapper { background:var(--card); border:2px solid var(--border); border-radius:14px; overflow:hidden; }
-  table { width:100%; border-collapse:collapse; font-size:0.9rem; }
-  thead { background:#0f1524; border-bottom:2px solid var(--border); }
-  th { text-align:left; padding:14px 16px; color:var(--accent); font-weight:700; font-size:0.8rem; text-transform:uppercase; letter-spacing:0.5px; }
-  td { padding:14px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
-  tbody tr:hover { background:var(--card-hover); }
-  tbody tr:last-child td { border-bottom:none; }
-  .order-id { font-family:monospace; color:var(--accent); font-weight:600; font-size:0.85rem; }
-  .ign { font-weight:600; }
-  .discord { color:var(--muted); font-size:0.85rem; }
-  .method-badge { display:inline-block; padding:4px 10px; border-radius:6px; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; }
-  .method-paypal { background:#003087; color:#fff; }
-  .method-crypto { background:#26a17b; color:#fff; }
-  .status-badge { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:20px; font-weight:700; font-size:0.8rem; white-space:nowrap; }
-  .status-pending { background:rgba(245,158,11,0.2); color:var(--warning); border:1px solid var(--warning); }
-  .status-approved { background:rgba(16,185,129,0.2); color:var(--success); border:1px solid var(--success); }
-  .status-rejected { background:rgba(239,68,68,0.2); color:var(--danger); border:1px solid var(--danger); }
-  .total-cell { font-weight:800; color:var(--accent); font-family:monospace; font-size:1rem; }
-  .actions-cell { display:flex; gap:6px; flex-wrap:wrap; }
-  .btn-action { border:none; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; cursor:pointer; transition:all 0.15s; font-family:inherit; }
-  .btn-accept { background:var(--success); color:#fff; }
-  .btn-accept:hover:not(:disabled) { background:#059669; }
-  .btn-reject { background:var(--danger); color:#fff; }
-  .btn-reject:hover:not(:disabled) { background:#b91c1c; }
-  .btn-reset { background:#6366f1; color:#fff; }
-  .btn-reset:hover { background:#4f46e5; }
-  .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
-  .btn-image { background:#3b82f6; color:#fff; text-decoration:none; display:inline-block; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; }
-  .btn-image:hover { background:#2563eb; }
-  .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
-  .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
-  .toast.show { transform:translateY(0); opacity:1; }
-  .toast.success { border-color:var(--success); }
-  .toast.error { border-color:var(--danger); }
-  .confirm-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); backdrop-filter:blur(6px); display:none; justify-content:center; align-items:center; z-index:10000; padding:20px; }
-  .confirm-overlay.open { display:flex; }
-  .confirm-modal { background:var(--card); border:2px solid var(--accent); border-radius:18px; padding:32px 28px; width:100%; max-width:480px; box-shadow:0 20px 60px rgba(0,0,0,0.6); text-align:center; animation:popIn 0.25s ease; }
-  @keyframes popIn { from { opacity:0; transform:scale(0.9); } to { opacity:1; transform:scale(1); } }
-  .confirm-icon { font-size:3rem; margin-bottom:15px; display:block; }
-  .confirm-title { font-size:1.4rem; font-weight:800; color:var(--text); margin-bottom:10px; }
-  .confirm-message { color:var(--muted); font-size:0.95rem; line-height:1.6; margin-bottom:25px; }
-  .confirm-message strong { color:var(--accent); }
-  .confirm-actions { display:flex; gap:12px; justify-content:center; }
-  .btn-confirm-cancel, .btn-confirm-ok { padding:12px 26px; border:none; border-radius:10px; font-weight:800; font-size:0.95rem; cursor:pointer; transition:all 0.2s; font-family:inherit; min-width:120px; }
-  .btn-confirm-cancel { background:transparent; border:2px solid var(--border); color:var(--text); }
-  .btn-confirm-cancel:hover { background:var(--card-hover); border-color:var(--muted); }
-  .btn-confirm-ok { color:#fff; }
-  .btn-confirm-ok.accept { background:var(--success); }
-  .btn-confirm-ok.accept:hover { background:#059669; }
-  .btn-confirm-ok.reject { background:var(--danger); }
-  .btn-confirm-ok.reject:hover { background:#b91c1c; }
-  .btn-confirm-ok.reset { background:#6366f1; }
-  .btn-confirm-ok.reset:hover { background:#4f46e5; }
-  @media (max-width:900px) { table { font-size:0.8rem; } th, td { padding:10px 12px; } h1 { font-size:1.4rem; } h1 span { display:block; margin-left:0; margin-top:4px; } }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <h1>NashmiMC Admin <span>— Order Management</span></h1>
-    <div class="refresh-info">Auto-refresh in <strong id="countdown">15</strong>s</div>
-  </header>
-
-  <div class="stats-grid">
-    <div class="stat-card"><div class="stat-label">Total Orders</div><div class="stat-value" id="statTotal">—</div></div>
-    <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-value yellow" id="statPending">—</div></div>
-    <div class="stat-card"><div class="stat-label">Approved</div><div class="stat-value green" id="statApproved">—</div></div>
-    <div class="stat-card"><div class="stat-label">Rejected</div><div class="stat-value red" id="statRejected">—</div></div>
-    <div class="stat-card"><div class="stat-label">Revenue (Approved)</div><div class="stat-value green" id="statRevenue">—</div></div>
-  </div>
-
-  <div class="search-bar">
-    <input type="text" id="searchInput" placeholder="Search by Order ID, IGN, or Discord...">
-    <select id="filterStatus">
-      <option value="">All Statuses</option>
-      <option value="pending">Pending</option>
-      <option value="approved">Approved</option>
-      <option value="rejected">Rejected</option>
-    </select>
-    <button id="refreshBtn">Refresh Now</button>
-  </div>
-
-  <div class="orders-table-wrapper">
-    <table>
-      <thead>
-        <tr>
-          <th>Order ID</th>
-          <th>Player</th>
-          <th>Method</th>
-          <th>Items</th>
-          <th>Total</th>
-          <th>Proof</th>
-          <th>Status</th>
-          <th>Date</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="ordersTbody">
-        <tr><td colspan="9" class="empty-state">Loading...</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<div class="confirm-overlay" id="confirmOverlay">
-  <div class="confirm-modal">
-    <span class="confirm-icon" id="confirmIcon">⚠️</span>
-    <div class="confirm-title" id="confirmTitle">Are you sure?</div>
-    <div class="confirm-message" id="confirmMessage">Please confirm this action.</div>
-    <div class="confirm-actions">
-      <button class="btn-confirm-cancel" id="confirmCancelBtn">Cancel</button>
-      <button class="btn-confirm-ok" id="confirmOkBtn">Confirm</button>
-    </div>
-  </div>
-</div>
-
-<script>
-var refreshTimer = null;
-var countdownTimer = null;
-var secondsLeft = 15;
-var allOrders = [];
-var pendingConfirm = null;
-
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
-
-function showToast(message, type) {
-  var t = document.getElementById('toast');
-  t.textContent = message;
-  t.className = 'toast show ' + (type || '');
-  setTimeout(function () { t.className = 'toast'; }, 3000);
-}
-
-function statusInfo(status) {
-  if (status === 'approved' || status === 'مقبول') return { cls:'status-approved', icon:'\\u2713', label:'Approved' };
-  if (status === 'rejected' || status === 'مرفوض') return { cls:'status-rejected', icon:'\\u2715', label:'Rejected' };
-  return { cls:'status-pending', icon:'\\u23F1', label:'Pending' };
-}
-
-function loadStats() {
-  fetch('/api/stats')
-    .then(function (r) { return r.json(); })
-    .then(function (data) {
-      if (!data.ok) throw new Error(data.error || 'Failed');
-      document.getElementById('statTotal').textContent = data.totalOrders || 0;
-      var byStatus = data.byStatus || {};
-      document.getElementById('statPending').textContent = byStatus['pending'] || 0;
-      document.getElementById('statApproved').textContent = byStatus['approved'] || 0;
-      document.getElementById('statRejected').textContent = byStatus['rejected'] || 0;
-      document.getElementById('statRevenue').textContent = '$' + Number(data.totalRevenue || 0).toFixed(2);
-      allOrders = data.recentOrders || [];
-      renderOrders();
-    })
-    .catch(function (err) { console.error(err); showToast('Failed to load orders', 'error'); });
-}
-
-function renderOrders() {
-  var tbody = document.getElementById('ordersTbody');
-  var search = document.getElementById('searchInput').value.trim().toLowerCase();
-  var filterStatus = document.getElementById('filterStatus').value;
-  var filtered = allOrders;
-
-  if (search) {
-    filtered = filtered.filter(function (o) {
-      return String(o.id||'').toLowerCase().indexOf(search) !== -1 ||
-             String(o.ign||'').toLowerCase().indexOf(search) !== -1 ||
-             String(o.discordUser||'').toLowerCase().indexOf(search) !== -1;
+    cart.push({
+        title: `Custom Rank: [${rankObj.name}]`,
+        price,
+        details: rankObj.details
     });
-  }
 
-  if (filterStatus) {
-    filtered = filtered.filter(function (o) {
-      if (filterStatus === 'pending') return o.status === 'pending' || o.status === 'قيد الانتظار';
-      if (filterStatus === 'approved') return o.status === 'approved' || o.status === 'مقبول';
-      if (filterStatus === 'rejected') return o.status === 'rejected' || o.status === 'مرفوض';
-      return true;
-    });
-  }
+    updateCartUI();
 
-  if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No orders match your filters.</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = filtered.map(function (o) {
-    var si = statusInfo(o.status);
-    var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
-    var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
-    var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
-    
-    var proofHtml = '—';
-    if (o.imageUrl) {
-      proofHtml = '<a href="' + escapeHtml(o.imageUrl) + '" target="_blank" class="btn-image">View Proof</a>';
-    }
-
-    return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
-      '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
-      '<td><div class="ign">' + escapeHtml(o.ign || '—') + '</div><div class="discord">' + escapeHtml(o.discordUser || '') + '</div></td>' +
-      '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
-      '<td>' + itemsStr + '</td>' +
-      '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
-      '<td>' + proofHtml + '</td>' +
-      '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
-      '<td>' + escapeHtml(dateStr) + '</td>' +
-      '<td><div class="actions-cell">' +
-        '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '">Accept</button>' +
-        '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '">Reject</button>' +
-        '<button class="btn-action btn-reset" data-action="reset" data-id="' + escapeHtml(o.id) + '">Reset</button>' +
-      '</div></td>' +
-    '</tr>';
-  }).join('');
-
-  var buttons = tbody.querySelectorAll('[data-action]');
-  for (var i = 0; i < buttons.length; i++) {
-    buttons[i].addEventListener('click', function () {
-      askConfirm(this.dataset.id, this.dataset.action);
-    });
-  }
+    if (goToCheckout) openCheckoutModal();
+    else showNotification('<i class="fa-solid fa-cart-plus"></i>', 'Custom Rank Added', 'Your custom rank has been added to the cart.');
 }
 
-function askConfirm(orderId, action) {
-  var icon = '⚠️';
-  var title = 'Are you sure?';
-  var message = '';
-  var btnLabel = 'Confirm';
-
-  if (action === 'accept') {
-    icon = '✅';
-    title = 'Accept this order?';
-    message = 'You are about to <strong>Accept</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Approved.';
-    btnLabel = 'Accept';
-  } else if (action === 'reject') {
-    icon = '❌';
-    title = 'Reject this order?';
-    message = 'You are about to <strong>Reject</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Rejected.';
-    btnLabel = 'Reject';
-  } else if (action === 'reset') {
-    icon = '🔄';
-    title = 'Reset this order?';
-    message = 'You are about to <strong>Reset</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will set it back to Pending.';
-    btnLabel = 'Reset';
-  }
-
-  document.getElementById('confirmIcon').textContent = icon;
-  document.getElementById('confirmTitle').textContent = title;
-  document.getElementById('confirmMessage').innerHTML = message;
-
-  var okBtn = document.getElementById('confirmOkBtn');
-  okBtn.textContent = btnLabel;
-  okBtn.className = 'btn-confirm-ok ' + action;
-
-  pendingConfirm = { orderId: orderId, action: action };
-
-  document.getElementById('confirmOverlay').classList.add('open');
+/* =========================================================
+   ESCAPE HTML
+   ========================================================= */
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
 }
-
-function closeConfirm() {
-  document.getElementById('confirmOverlay').classList.remove('open');
-  pendingConfirm = null;
-}
-
-function executeConfirm() {
-  if (!pendingConfirm) return;
-  var orderId = pendingConfirm.orderId;
-  var action = pendingConfirm.action;
-  closeConfirm();
-
-  fetch('/api/admin/update-order', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ orderId: orderId, action: action })
-  })
-    .then(function (r) { return r.json(); })
-    .then(function (data) {
-      if (!data.success) throw new Error(data.error || 'Failed');
-      var verb = action === 'accept' ? 'accepted' : action === 'reject' ? 'rejected' : 'reset';
-      showToast('Order ' + orderId + ' ' + verb + ' successfully.', 'success');
-      loadStats();
-    })
-    .catch(function (err) { console.error(err); showToast('Failed: ' + err.message, 'error'); });
-}
-
-document.getElementById('confirmOkBtn').addEventListener('click', executeConfirm);
-document.getElementById('confirmCancelBtn').addEventListener('click', closeConfirm);
-document.getElementById('confirmOverlay').addEventListener('click', function (e) {
-  if (e.target === this) closeConfirm();
-});
-document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') closeConfirm();
-});
-
-function resetTimers() {
-  clearInterval(refreshTimer);
-  clearInterval(countdownTimer);
-  secondsLeft = 15;
-  document.getElementById('countdown').textContent = secondsLeft;
-
-  countdownTimer = setInterval(function () {
-    secondsLeft--;
-    if (secondsLeft < 0) secondsLeft = 15;
-    document.getElementById('countdown').textContent = secondsLeft;
-  }, 1000);
-
-  refreshTimer = setInterval(function () { loadStats(); secondsLeft = 15; }, 15000);
-}
-
-document.getElementById('refreshBtn').addEventListener('click', function () {
-  loadStats();
-  secondsLeft = 15;
-  showToast('Refreshed.', 'success');
-});
-
-document.getElementById('searchInput').addEventListener('input', renderOrders);
-document.getElementById('filterStatus').addEventListener('change', renderOrders);
-
-loadStats();
-resetTimers();
-</script>
-</body>
-</html>`;
-
-app.get('/admin', adminAuth, (req, res) => { res.set('Content-Type', 'text/html; charset=utf-8'); res.send(ADMIN_HTML); });
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] Express listening on 0.0.0.0:${PORT}`);
-    initDatabase();
-});
-
-process.on('SIGTERM', () => console.log('[SHUTDOWN] Received SIGTERM. Ignoring...'));
-process.on('SIGINT', () => console.log('[SHUTDOWN] Received SIGINT. Ignoring...'));
-process.on('unhandledRejection', (reason) => console.error('[UNHANDLED REJECTION]', reason));
-process.on('uncaughtException', (error) => console.error('[UNCAUGHT EXCEPTION]', error));
