@@ -1,8 +1,5 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10.3 (Final & Fixed)
-   Changes:
-   - Fixed syntax error in createDiscordOrder.
-   - Added fallback in capture-order to check DB if Webhook finished first.
+   NashmiMC Store Bot — Production Build v10.5 (Full & Complete)
    ========================================================= */
 
 'use strict';
