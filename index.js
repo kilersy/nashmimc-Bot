@@ -1,8 +1,8 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10 (Fixed & Complete)
+   NashmiMC Store Bot — Production Build v10.3 (Final & Fixed)
    Changes:
-   - Replaced in-memory pendingPayPalOrders with DB table for persistence.
-   - Added PayPal Webhook to catch payments even if frontend fails.
+   - Fixed syntax error in createDiscordOrder.
+   - Added fallback in capture-order to check DB if Webhook finished first.
    ========================================================= */
 
 'use strict';
@@ -895,47 +895,51 @@ function buildActionButtons(orderId, currentStatus) {
 }
 
 async function createDiscordOrder(order, imageProof = null) {
-    const channel = await fetchAdminChannel();
+    try {
+        const channel = await fetchAdminChannel();
 
-    if (imageProof) {
-        try {
-            await sendPaymentProof(channel, imageProof);
-            console.log('[DISCORD] USDT payment proof uploaded.');
-        } catch (error) {
-            console.error('[DISCORD] Failed to upload payment proof:', error.message);
-        }
-    }
-
-    if (order.paymentMethod === 'PAYPAL' && !imageProof) {
-        try {
-            const invoiceBuffer = generateInvoiceImage(order);
-            if (invoiceBuffer) {
-                const attachment = new AttachmentBuilder(invoiceBuffer, {
-                    name: `invoice_${order.id}.png`
-                });
-                await channel.send({
-                    content: `🧾 **Auto-generated invoice for Order #${order.id}**`,
-                    files: [attachment],
-                    allowedMentions: { parse: [] }
-                });
-                console.log('[DISCORD] Auto-invoice sent.');
+        if (imageProof) {
+            try {
+                await sendPaymentProof(channel, imageProof);
+                console.log('[DISCORD] USDT payment proof uploaded.');
+            } catch (error) {
+                console.error('[DISCORD] Failed to upload payment proof:', error.message);
             }
-        } catch (error) {
-            console.error('[DISCORD] Failed to send invoice:', error.message);
         }
+
+        if (order.paymentMethod === 'PAYPAL' && !imageProof) {
+            try {
+                const invoiceBuffer = generateInvoiceImage(order);
+                if (invoiceBuffer) {
+                    const attachment = new AttachmentBuilder(invoiceBuffer, {
+                        name: `invoice_${order.id}.png`
+                    });
+                    await channel.send({
+                        content: `🧾 **Auto-generated invoice for Order #${order.id}**`,
+                        files: [attachment],
+                        allowedMentions: { parse: [] }
+                    });
+                    console.log('[DISCORD] Auto-invoice sent.');
+                }
+            } catch (error) {
+                console.error('[DISCORD] Failed to send invoice:', error.message);
+            }
+        }
+
+        const row = buildActionButtons(order.id, 'pending');
+
+        const sentMessage = await channel.send({
+            content: buildOrderMessage(order),
+            components: [row],
+            allowedMentions: { parse: [] }
+        });
+
+        await saveDiscordMessageIds(order.id, sentMessage.id, sentMessage.channel.id);
+
+        console.log(`[DISCORD] Order ${order.id} posted (message ${sentMessage.id}).`);
+    } catch (error) {
+        console.error('[DISCORD] Critical error while creating order:', error.message);
     }
-
-    const row = buildActionButtons(order.id, 'pending');
-
-    const sentMessage = await channel.send({
-        content: buildOrderMessage(order),
-        components: [row],
-        allowedMentions: { parse: [] }
-    });
-
-    await saveDiscordMessageIds(order.id, sentMessage.id, sentMessage.channel.id);
-
-    console.log(`[DISCORD] Order ${order.id} posted (message ${sentMessage.id}).`);
 }
 
 async function syncDiscordMessage(orderId, newStatus, actorName) {
@@ -1362,7 +1366,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
     } catch (error) {
         console.error('[PAYPAL] Capture order failed:', error);
         
-        if (error.message && error.message.includes('ORDER_ALREADY_CAPTURED')) {
+        if (error.message && (error.message.includes('ORDER_ALREADY_CAPTURED') || error.message.includes('already captured'))) {
             const existingOrder = await findOrderByPaypalId(req.body.paypalOrderId);
             if (existingOrder) {
                 return res.json({ success: true, orderId: existingOrder.id, paypalOrderId: req.body.paypalOrderId, total: existingOrder.total, status: existingOrder.status });
@@ -1377,7 +1381,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
 });
 
 /* =========================================================
-   POST /api/paypal/webhook (NEW)
+   POST /api/paypal/webhook
    ========================================================= */
 app.post('/api/paypal/webhook', async (req, res) => {
     res.status(200).send('OK');
@@ -1467,7 +1471,7 @@ app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
 });
 
 /* =========================================================
-   POST /api/admin/update-order — accept / reject / reset
+   POST /api/admin/update-order
    ========================================================= */
 app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) => {
     try {
@@ -1510,7 +1514,7 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
 });
 
 /* =========================================================
-   GET /admin — Dashboard
+   GET /admin
    ========================================================= */
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="en">
