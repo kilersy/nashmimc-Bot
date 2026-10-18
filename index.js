@@ -1,11 +1,9 @@
 /* =========================================================
-   NashmiMC Store Bot — Production Build v10.7 (Final & Fixed)
+   NashmiMC Store Bot — Production Build v10.8 (Final & Fixed)
    Changes:
-   - Fixed syntax error in createDiscordOrder.
-   - Added fallback in capture-order.
-   - Added trust proxy for Render (fixes express-rate-limit crash).
+   - Increased Rate Limit to fix Admin Panel loading loop.
+   - Disabled Rate Limit on /api/stats to fix Admin Panel.
    - Removed shutdown function to prevent SIGTERM kills on Render.
-   - Added error logging for client.login.
    ========================================================= */
 
 'use strict';
@@ -415,7 +413,7 @@ app.use((req, res, next) => {
 
 const globalLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 120,
+    max: 500, // رفعنا الحد الأقصى عشان نمنع الحظر
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many requests. Please slow down.' }
@@ -423,7 +421,7 @@ const globalLimiter = rateLimit({
 
 const orderLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 30,
+    max: 50,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many order attempts. Please wait a minute.' }
@@ -431,7 +429,7 @@ const orderLimiter = rateLimit({
 
 const trackingLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 60,
+    max: 120,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, error: 'Too many tracking requests.' }
@@ -1164,7 +1162,8 @@ app.get('/health', async (req, res) => {
 let statsCache = { data: null, timestamp: 0 };
 const STATS_CACHE_TTL = 10000;
 
-app.get('/api/stats', trackingLimiter, async (req, res) => {
+app.get('/api/stats', async (req, res) => {
+    // شلنا الـ trackingLimiter من هنا عشان لوحة الأدمن تفتح
     const now = Date.now();
 
     if (statsCache.data && (now - statsCache.timestamp) < STATS_CACHE_TTL) {
