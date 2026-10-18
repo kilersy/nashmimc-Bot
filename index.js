@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (No Bot)
+   NashmiMC Store — Webhook Only (Full Admin + Debug)
    ========================================================= */
 
 'use strict';
@@ -18,6 +18,9 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
+
+// سطر تأكيد عشان نتأكد إن السيرفر شايف الويب هوك
+console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET (starts with ' + DISCORD_WEBHOOK_URL.substring(0, 30) + '...)' : 'MISSING!');
 
 /* =========================================================
    PRODUCT CATALOG
@@ -202,6 +205,8 @@ async function sendDiscordWebhook(order, imageProof = null) {
         return;
     }
     try {
+        console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
+        
         const content = `🛒 **New Manual Order!**\n` +
             `- **Order ID:** #${order.id}\n` +
             `- **Player IGN:** \`${sanitizeForDiscord(order.ign, 32)}\`\n` +
@@ -218,9 +223,10 @@ async function sendDiscordWebhook(order, imageProof = null) {
         });
 
         if (!response.ok) {
-            console.error('[WEBHOOK] Failed to send Discord message.');
+            const errText = await response.text();
+            console.error(`[WEBHOOK] Failed to send. Status: ${response.status}. Response: ${errText}`);
         } else {
-            console.log(`[WEBHOOK] Order ${order.id} sent to Discord.`);
+            console.log(`[WEBHOOK] Order ${order.id} sent to Discord successfully.`);
         }
     } catch (error) {
         console.error('[WEBHOOK] Error sending to Discord:', error.message);
@@ -302,7 +308,352 @@ app.post('/api/admin/update-order', adminAuth, orderLimiter, async (req, res) =>
     } catch (error) { return res.status(500).json({ success: false, error: 'Internal error.' }); }
 });
 
-const ADMIN_HTML = `<!DOCTYPE html><html><head><title>Admin</title></head><body style="background:#111;color:#fff;font-family:sans-serif;padding:20px;"><h1>Admin</h1><div id="content">Loading...</div><script>fetch('/api/stats').then(r=>r.json()).then(d=>{if(!d.ok)return document.getElementById('content').innerText='Error';let h='<h3>Total Orders: '+d.totalOrders+'</h3><ul>';d.recentOrders.forEach(o=>h+='<li>'+o.id+' - '+o.ign+' - $'+o.total+'</li>');h+='</ul>';document.getElementById('content').innerHTML=h;}).catch(e=>document.getElementById('content').innerText='Error');</script></body></html>`;
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NashmiMC Admin — Orders</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0a0e1a; --card:#131b2e; --card-hover:#1a2340; --border:#2d3654; --accent:#fbbf24; --text:#f1f5f9; --muted:#94a3b8; --success:#10b981; --danger:#ef4444; --warning:#f59e0b; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Inter',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:20px; }
+  .container { max-width:1500px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:20px 0; border-bottom:2px solid var(--border); margin-bottom:30px; flex-wrap:wrap; gap:15px; }
+  h1 { font-size:1.8rem; color:var(--accent); font-weight:800; letter-spacing:-0.5px; }
+  h1 span { color:var(--text); font-weight:400; font-size:0.95rem; margin-left:12px; }
+  .refresh-info { font-size:0.85rem; color:var(--muted); }
+  .refresh-info strong { color:var(--accent); }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:15px; margin-bottom:30px; }
+  .stat-card { background:var(--card); border:2px solid var(--border); border-radius:14px; padding:22px; transition:all 0.2s; }
+  .stat-card:hover { border-color:var(--accent); transform:translateY(-2px); }
+  .stat-label { font-size:0.85rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px; font-weight:600; }
+  .stat-value { font-size:2.2rem; font-weight:800; color:var(--accent); }
+  .stat-value.green { color:var(--success); }
+  .stat-value.red { color:var(--danger); }
+  .stat-value.yellow { color:var(--warning); }
+  .search-bar { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+  .search-bar input, .search-bar select { background:var(--card); border:2px solid var(--border); color:var(--text); padding:12px 16px; border-radius:10px; font-size:0.95rem; outline:none; font-family:inherit; }
+  .search-bar input { flex:1; min-width:200px; }
+  .search-bar input:focus, .search-bar select:focus { border-color:var(--accent); }
+  .search-bar button { background:var(--accent); color:var(--bg); border:none; padding:12px 22px; border-radius:10px; font-weight:700; cursor:pointer; transition:all 0.2s; }
+  .search-bar button:hover { transform:scale(1.03); }
+  .orders-table-wrapper { background:var(--card); border:2px solid var(--border); border-radius:14px; overflow:hidden; }
+  table { width:100%; border-collapse:collapse; font-size:0.9rem; }
+  thead { background:#0f1524; border-bottom:2px solid var(--border); }
+  th { text-align:left; padding:14px 16px; color:var(--accent); font-weight:700; font-size:0.8rem; text-transform:uppercase; letter-spacing:0.5px; }
+  td { padding:14px 16px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  tbody tr:hover { background:var(--card-hover); }
+  tbody tr:last-child td { border-bottom:none; }
+  .order-id { font-family:monospace; color:var(--accent); font-weight:600; font-size:0.85rem; }
+  .ign { font-weight:600; }
+  .discord { color:var(--muted); font-size:0.85rem; }
+  .method-badge { display:inline-block; padding:4px 10px; border-radius:6px; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; }
+  .method-paypal { background:#003087; color:#fff; }
+  .method-crypto { background:#26a17b; color:#fff; }
+  .status-badge { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:20px; font-weight:700; font-size:0.8rem; white-space:nowrap; }
+  .status-pending { background:rgba(245,158,11,0.2); color:var(--warning); border:1px solid var(--warning); }
+  .status-approved { background:rgba(16,185,129,0.2); color:var(--success); border:1px solid var(--success); }
+  .status-rejected { background:rgba(239,68,68,0.2); color:var(--danger); border:1px solid var(--danger); }
+  .total-cell { font-weight:800; color:var(--accent); font-family:monospace; font-size:1rem; }
+  .actions-cell { display:flex; gap:6px; flex-wrap:wrap; }
+  .btn-action { border:none; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; cursor:pointer; transition:all 0.15s; font-family:inherit; }
+  .btn-accept { background:var(--success); color:#fff; }
+  .btn-accept:hover:not(:disabled) { background:#059669; }
+  .btn-reject { background:var(--danger); color:#fff; }
+  .btn-reject:hover:not(:disabled) { background:#b91c1c; }
+  .btn-reset { background:#6366f1; color:#fff; }
+  .btn-reset:hover { background:#4f46e5; }
+  .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
+  .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
+  .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
+  .toast.show { transform:translateY(0); opacity:1; }
+  .toast.success { border-color:var(--success); }
+  .toast.error { border-color:var(--danger); }
+  .confirm-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); backdrop-filter:blur(6px); display:none; justify-content:center; align-items:center; z-index:10000; padding:20px; }
+  .confirm-overlay.open { display:flex; }
+  .confirm-modal { background:var(--card); border:2px solid var(--accent); border-radius:18px; padding:32px 28px; width:100%; max-width:480px; box-shadow:0 20px 60px rgba(0,0,0,0.6); text-align:center; animation:popIn 0.25s ease; }
+  @keyframes popIn { from { opacity:0; transform:scale(0.9); } to { opacity:1; transform:scale(1); } }
+  .confirm-icon { font-size:3rem; margin-bottom:15px; display:block; }
+  .confirm-title { font-size:1.4rem; font-weight:800; color:var(--text); margin-bottom:10px; }
+  .confirm-message { color:var(--muted); font-size:0.95rem; line-height:1.6; margin-bottom:25px; }
+  .confirm-message strong { color:var(--accent); }
+  .confirm-actions { display:flex; gap:12px; justify-content:center; }
+  .btn-confirm-cancel, .btn-confirm-ok { padding:12px 26px; border:none; border-radius:10px; font-weight:800; font-size:0.95rem; cursor:pointer; transition:all 0.2s; font-family:inherit; min-width:120px; }
+  .btn-confirm-cancel { background:transparent; border:2px solid var(--border); color:var(--text); }
+  .btn-confirm-cancel:hover { background:var(--card-hover); border-color:var(--muted); }
+  .btn-confirm-ok { color:#fff; }
+  .btn-confirm-ok.accept { background:var(--success); }
+  .btn-confirm-ok.accept:hover { background:#059669; }
+  .btn-confirm-ok.reject { background:var(--danger); }
+  .btn-confirm-ok.reject:hover { background:#b91c1c; }
+  .btn-confirm-ok.reset { background:#6366f1; }
+  .btn-confirm-ok.reset:hover { background:#4f46e5; }
+  @media (max-width:900px) { table { font-size:0.8rem; } th, td { padding:10px 12px; } h1 { font-size:1.4rem; } h1 span { display:block; margin-left:0; margin-top:4px; } }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>NashmiMC Admin <span>— Order Management</span></h1>
+    <div class="refresh-info">Auto-refresh in <strong id="countdown">15</strong>s</div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">Total Orders</div><div class="stat-value" id="statTotal">—</div></div>
+    <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-value yellow" id="statPending">—</div></div>
+    <div class="stat-card"><div class="stat-label">Approved</div><div class="stat-value green" id="statApproved">—</div></div>
+    <div class="stat-card"><div class="stat-label">Rejected</div><div class="stat-value red" id="statRejected">—</div></div>
+    <div class="stat-card"><div class="stat-label">Revenue (Approved)</div><div class="stat-value green" id="statRevenue">—</div></div>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="Search by Order ID, IGN, or Discord...">
+    <select id="filterStatus">
+      <option value="">All Statuses</option>
+      <option value="pending">Pending</option>
+      <option value="approved">Approved</option>
+      <option value="rejected">Rejected</option>
+    </select>
+    <button id="refreshBtn">Refresh Now</button>
+  </div>
+
+  <div class="orders-table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>Order ID</th>
+          <th>Player</th>
+          <th>Method</th>
+          <th>Items</th>
+          <th>Total</th>
+          <th>Status</th>
+          <th>Date</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ordersTbody">
+        <tr><td colspan="8" class="empty-state">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="confirm-overlay" id="confirmOverlay">
+  <div class="confirm-modal">
+    <span class="confirm-icon" id="confirmIcon">⚠️</span>
+    <div class="confirm-title" id="confirmTitle">Are you sure?</div>
+    <div class="confirm-message" id="confirmMessage">Please confirm this action.</div>
+    <div class="confirm-actions">
+      <button class="btn-confirm-cancel" id="confirmCancelBtn">Cancel</button>
+      <button class="btn-confirm-ok" id="confirmOkBtn">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var refreshTimer = null;
+var countdownTimer = null;
+var secondsLeft = 15;
+var allOrders = [];
+var pendingConfirm = null;
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function showToast(message, type) {
+  var t = document.getElementById('toast');
+  t.textContent = message;
+  t.className = 'toast show ' + (type || '');
+  setTimeout(function () { t.className = 'toast'; }, 3000);
+}
+
+function statusInfo(status) {
+  if (status === 'approved' || status === 'مقبول') return { cls:'status-approved', icon:'\\u2713', label:'Approved' };
+  if (status === 'rejected' || status === 'مرفوض') return { cls:'status-rejected', icon:'\\u2715', label:'Rejected' };
+  return { cls:'status-pending', icon:'\\u23F1', label:'Pending' };
+}
+
+function loadStats() {
+  fetch('/api/stats')
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (!data.ok) throw new Error(data.error || 'Failed');
+      document.getElementById('statTotal').textContent = data.totalOrders || 0;
+      var byStatus = data.byStatus || {};
+      document.getElementById('statPending').textContent = byStatus['pending'] || 0;
+      document.getElementById('statApproved').textContent = byStatus['approved'] || 0;
+      document.getElementById('statRejected').textContent = byStatus['rejected'] || 0;
+      document.getElementById('statRevenue').textContent = '$' + Number(data.totalRevenue || 0).toFixed(2);
+      allOrders = data.recentOrders || [];
+      renderOrders();
+    })
+    .catch(function (err) { console.error(err); showToast('Failed to load orders', 'error'); });
+}
+
+function renderOrders() {
+  var tbody = document.getElementById('ordersTbody');
+  var search = document.getElementById('searchInput').value.trim().toLowerCase();
+  var filterStatus = document.getElementById('filterStatus').value;
+  var filtered = allOrders;
+
+  if (search) {
+    filtered = filtered.filter(function (o) {
+      return String(o.id||'').toLowerCase().indexOf(search) !== -1 ||
+             String(o.ign||'').toLowerCase().indexOf(search) !== -1 ||
+             String(o.discordUser||'').toLowerCase().indexOf(search) !== -1;
+    });
+  }
+
+  if (filterStatus) {
+    filtered = filtered.filter(function (o) {
+      if (filterStatus === 'pending') return o.status === 'pending' || o.status === 'قيد الانتظار';
+      if (filterStatus === 'approved') return o.status === 'approved' || o.status === 'مقبول';
+      if (filterStatus === 'rejected') return o.status === 'rejected' || o.status === 'مرفوض';
+      return true;
+    });
+  }
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No orders match your filters.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(function (o) {
+    var si = statusInfo(o.status);
+    var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
+    var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
+    var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
+
+    return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
+      '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
+      '<td><div class="ign">' + escapeHtml(o.ign || '—') + '</div><div class="discord">' + escapeHtml(o.discordUser || '') + '</div></td>' +
+      '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
+      '<td>' + itemsStr + '</td>' +
+      '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
+      '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
+      '<td>' + escapeHtml(dateStr) + '</td>' +
+      '<td><div class="actions-cell">' +
+        '<button class="btn-action btn-accept" data-action="accept" data-id="' + escapeHtml(o.id) + '">Accept</button>' +
+        '<button class="btn-action btn-reject" data-action="reject" data-id="' + escapeHtml(o.id) + '">Reject</button>' +
+        '<button class="btn-action btn-reset" data-action="reset" data-id="' + escapeHtml(o.id) + '">Reset</button>' +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+
+  var buttons = tbody.querySelectorAll('[data-action]');
+  for (var i = 0; i < buttons.length; i++) {
+    buttons[i].addEventListener('click', function () {
+      askConfirm(this.dataset.id, this.dataset.action);
+    });
+  }
+}
+
+function askConfirm(orderId, action) {
+  var icon = '⚠️';
+  var title = 'Are you sure?';
+  var message = '';
+  var btnLabel = 'Confirm';
+
+  if (action === 'accept') {
+    icon = '✅';
+    title = 'Accept this order?';
+    message = 'You are about to <strong>Accept</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Approved.';
+    btnLabel = 'Accept';
+  } else if (action === 'reject') {
+    icon = '❌';
+    title = 'Reject this order?';
+    message = 'You are about to <strong>Reject</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will mark it as Rejected.';
+    btnLabel = 'Reject';
+  } else if (action === 'reset') {
+    icon = '🔄';
+    title = 'Reset this order?';
+    message = 'You are about to <strong>Reset</strong> order <strong>' + escapeHtml(orderId) + '</strong>. This will set it back to Pending.';
+    btnLabel = 'Reset';
+  }
+
+  document.getElementById('confirmIcon').textContent = icon;
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMessage').innerHTML = message;
+
+  var okBtn = document.getElementById('confirmOkBtn');
+  okBtn.textContent = btnLabel;
+  okBtn.className = 'btn-confirm-ok ' + action;
+
+  pendingConfirm = { orderId: orderId, action: action };
+
+  document.getElementById('confirmOverlay').classList.add('open');
+}
+
+function closeConfirm() {
+  document.getElementById('confirmOverlay').classList.remove('open');
+  pendingConfirm = null;
+}
+
+function executeConfirm() {
+  if (!pendingConfirm) return;
+  var orderId = pendingConfirm.orderId;
+  var action = pendingConfirm.action;
+  closeConfirm();
+
+  fetch('/api/admin/update-order', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ orderId: orderId, action: action })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (!data.success) throw new Error(data.error || 'Failed');
+      var verb = action === 'accept' ? 'accepted' : action === 'reject' ? 'rejected' : 'reset';
+      showToast('Order ' + orderId + ' ' + verb + ' successfully.', 'success');
+      loadStats();
+    })
+    .catch(function (err) { console.error(err); showToast('Failed: ' + err.message, 'error'); });
+}
+
+document.getElementById('confirmOkBtn').addEventListener('click', executeConfirm);
+document.getElementById('confirmCancelBtn').addEventListener('click', closeConfirm);
+document.getElementById('confirmOverlay').addEventListener('click', function (e) {
+  if (e.target === this) closeConfirm();
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') closeConfirm();
+});
+
+function resetTimers() {
+  clearInterval(refreshTimer);
+  clearInterval(countdownTimer);
+  secondsLeft = 15;
+  document.getElementById('countdown').textContent = secondsLeft;
+
+  countdownTimer = setInterval(function () {
+    secondsLeft--;
+    if (secondsLeft < 0) secondsLeft = 15;
+    document.getElementById('countdown').textContent = secondsLeft;
+  }, 1000);
+
+  refreshTimer = setInterval(function () { loadStats(); secondsLeft = 15; }, 15000);
+}
+
+document.getElementById('refreshBtn').addEventListener('click', function () {
+  loadStats();
+  secondsLeft = 15;
+  showToast('Refreshed.', 'success');
+});
+
+document.getElementById('searchInput').addEventListener('input', renderOrders);
+document.getElementById('filterStatus').addEventListener('change', renderOrders);
+
+loadStats();
+resetTimers();
+</script>
+</body>
+</html>`;
+
 app.get('/admin', adminAuth, (req, res) => { res.set('Content-Type', 'text/html; charset=utf-8'); res.send(ADMIN_HTML); });
 
 app.listen(PORT, '0.0.0.0', () => {
