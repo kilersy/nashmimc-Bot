@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + DB Save First)
+   NashmiMC Store — Webhook Only (Full Admin + PayPal Support)
    ========================================================= */
 
 'use strict';
@@ -63,7 +63,6 @@ async function initDatabase() {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
-        // Add columns if they don't exist (for old tables)
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS image_url TEXT`);
         await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS image_proof TEXT`);
 
@@ -288,11 +287,9 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             imageUrl: null
         };
         
-        // بنحفظ الأوردر الأول (عشان نضمن وصوله للأدمن)
         const saved = await addOrder(order);
         if (!saved) throw new Error('Failed to save order to database.');
 
-        // بعدين بنحاول نبعت للديسكورد
         await sendDiscordWebhook(order, imageProof);
         
         return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
