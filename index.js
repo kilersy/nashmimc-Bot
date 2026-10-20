@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — PayPal Automatic + Full Admin
+   NashmiMC Store — PayPal Automatic + Full Admin (Card Fix)
    ========================================================= */
 
 'use strict';
@@ -37,7 +37,7 @@ const PRODUCT_CATALOG = {
     'DOOM key': 2.49, 'MAGMA Key': 4.99, 'MYTHIC Key': 9.99, 'Mecha Key': 5.00
 };
 const ALLOWED_KEY_PRODUCTS = ['DOOM key', 'MAGMA Key', 'MYTHIC Key', 'Mecha Key'];
-const VALID_COUPON = 'NASHMI2026';
+const VALID_COUPON = 'VIP2026';
 const COUPON_DISCOUNT = 0.15;
 
 /* =========================================================
@@ -320,7 +320,6 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
         if (!paypalOrderId) return res.status(400).json({ success: false, error: 'Order ID required.' });
         if (!isValidIgn(ign) || !isValidDiscordUser(discordUser)) return res.status(400).json({ success: false, error: 'Invalid user details.' });
 
-        // لو الأوردر ده اتعمله كابتشر قبل كده، منعملش حاجة ونرجع النجاح
         const existingOrder = await findOrderById(clientOrderId);
         if (existingOrder) {
             return res.json({ success: true, orderId: existingOrder.id, total: existingOrder.total, status: existingOrder.status });
@@ -329,7 +328,10 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
         const paypalResponse = await paypalCaptureOrder(paypalOrderId);
         const capture = getCapturedAmount(paypalResponse);
         
-        if (!capture || capture.status !== 'COMPLETED') throw new Error('Payment not completed.');
+        // تعديل هام: بنقبل حالة COMPLETED أو PENDING
+        if (!capture || (capture.status !== 'COMPLETED' && capture.status !== 'PENDING')) {
+            throw new Error('Payment not completed or pending.');
+        }
         if (capture.currency !== 'USD') throw new Error('Unexpected PayPal currency.');
 
         const cart = validateAndBuildCart(items);
