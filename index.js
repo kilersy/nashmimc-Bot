@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + PayPal Support)
+   NashmiMC Store — Webhook Only (Full Admin + PayPal Route)
    ========================================================= */
 
 'use strict';
@@ -18,6 +18,13 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
+
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
+const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'live').toLowerCase();
+const PAYPAL_BASE_URL = PAYPAL_MODE === 'sandbox'
+    ? 'https://api-m.sandbox.paypal.com'
+    : 'https://api-m.paypal.com';
 
 console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET' : 'MISSING!');
 
@@ -236,6 +243,54 @@ async function sendDiscordWebhook(order, imageProof = null) {
     }
 }
 
+/* =========================================================
+   PAYPAL HELPERS (Restored)
+   ========================================================= */
+function ensurePayPalConfigured() {
+    if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+        throw new Error('PayPal environment variables are not configured.');
+    }
+}
+
+async function paypalAccessToken() {
+    ensurePayPalConfigured();
+    const credentials = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+    const response = await fetch(`${PAYPAL_BASE_URL}/v1/oauth2/token`, {
+        method: 'POST', headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=client_credentials'
+    });
+    const data = await response.json();
+    if (!response.ok || !data.access_token) throw new Error('Unable to authenticate with PayPal.');
+    return data.access_token;
+}
+
+async function paypalCreateOrder(total, internalOrderId) {
+    const accessToken = await paypalAccessToken();
+    const payload = { intent: 'CAPTURE', purchase_units: [{ reference_id: internalOrderId, amount: { currency_code: 'USD', value: Number(total).toFixed(2) } }] };
+    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'PayPal-Request-Id': internalOrderId },
+        body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.message || 'PayPal could not create the order.');
+    return data;
+}
+
+async function paypalCaptureOrder(paypalOrderId) {
+    const accessToken = await paypalAccessToken();
+    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}/capture`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.message || 'PayPal could not capture the payment.');
+    return data;
+}
+
+function getCapturedAmount(paypalResponse) {
+    const capture = paypalResponse?.purchase_units?.[0]?.payments?.captures?.[0];
+    return capture ? { status: capture.status, value: Number(capture?.amount?.value), currency: capture?.amount?.currency_code } : null;
+}
+
 function adminAuth(req, res, next) {
     if (!ADMIN_PASSWORD) return res.status(503).send('Admin password not configured.');
     const authHeader = req.headers.authorization || '';
@@ -259,6 +314,21 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/api/stats', trackingLimiter, async (req, res) => res.json(await getStats()));
+
+app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
+    try {
+        const { clientOrderId, ign, discordUser, items, couponCode } = req.body || {};
+        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser)) return res.status(400).json({ success: false, error: 'Invalid user details.' });
+        const cart = validateAndBuildCart(items);
+        const total = calculateDiscountedTotal(cart.subtotal, couponCode);
+        if (total <= 0) return res.status(400).json({ success: false, error: 'Invalid total.' });
+        const internalOrderId = createServerOrderId();
+        const paypalOrder = await paypalCreateOrder(total, internalOrderId);
+        if (!paypalOrder?.id) throw new Error('PayPal did not return an order ID.');
+        
+        return res.json({ success: true, orderID: paypalOrder.id, total });
+    } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
+});
 
 app.post('/api/new-order', orderLimiter, async (req, res) => {
     try {
