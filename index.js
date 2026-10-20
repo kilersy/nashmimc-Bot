@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + PayPal Capture + Image Fix)
+   NashmiMC Store — PayPal Automatic + Full Admin
    ========================================================= */
 
 'use strict';
@@ -64,13 +64,9 @@ async function initDatabase() {
                 payment_method VARCHAR(16) NOT NULL, payment_reference VARCHAR(255), subtotal NUMERIC(10, 2) NOT NULL,
                 total NUMERIC(10, 2) NOT NULL, coupon_code VARCHAR(32), items JSONB NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending', 
-                image_url TEXT, 
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
-        await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS image_url TEXT`);
-        await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS image_proof TEXT`);
-
         dbReady = true;
         console.log('[DB] Connected and schema ready.');
     } catch (err) {
@@ -82,7 +78,7 @@ function rowToOrder(row) {
     return {
         id: row.id, ign: row.ign, discordUser: row.discord_user, paymentMethod: row.payment_method,
         paymentReference: row.payment_reference, subtotal: Number(row.subtotal), total: Number(row.total),
-        couponCode: row.coupon_code, items: row.items, status: row.status, imageUrl: row.image_url,
+        couponCode: row.coupon_code, items: row.items, status: row.status,
         date: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at)
     };
 }
@@ -91,10 +87,10 @@ async function addOrder(order) {
     if (!dbReady) return false;
     try {
         await db.query(
-            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status, image_url) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            `INSERT INTO orders (id, ign, discord_user, payment_method, payment_reference, subtotal, total, coupon_code, items, status) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
             [order.id, order.ign, order.discordUser, order.paymentMethod, order.paymentReference || null,
-             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status, order.imageUrl || null]
+             order.subtotal, order.total, order.couponCode || null, JSON.stringify(order.items), order.status]
         );
         return true;
     } catch (err) { console.error('[DB] addOrder failed:', err.message); return false; }
@@ -208,11 +204,8 @@ function validateAndBuildCart(items) {
     return { items: validatedItems, subtotal: roundMoney(validatedItems.reduce((sum, item) => sum + Number(item.price), 0)) };
 }
 
-async function sendDiscordWebhook(order, imageProof = null) {
-    if (!DISCORD_WEBHOOK_URL) {
-        console.warn('[WEBHOOK] DISCORD_WEBHOOK_URL is not set.');
-        return;
-    }
+async function sendDiscordWebhook(order) {
+    if (!DISCORD_WEBHOOK_URL) return;
 
     try {
         console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
@@ -241,6 +234,47 @@ async function sendDiscordWebhook(order, imageProof = null) {
     }
 }
 
+/* =========================================================
+   PAYPAL HELPERS
+   ========================================================= */
+async function paypalAccessToken() {
+    const credentials = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+    const response = await fetch(`${PAYPAL_BASE_URL}/v1/oauth2/token`, {
+        method: 'POST', headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=client_credentials'
+    });
+    const data = await response.json();
+    if (!response.ok || !data.access_token) throw new Error('Unable to authenticate with PayPal.');
+    return data.access_token;
+}
+
+async function paypalCreateOrder(total, internalOrderId) {
+    const accessToken = await paypalAccessToken();
+    const payload = { intent: 'CAPTURE', purchase_units: [{ reference_id: internalOrderId, amount: { currency_code: 'USD', value: Number(total).toFixed(2) } }] };
+    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'PayPal-Request-Id': internalOrderId },
+        body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.message || 'PayPal could not create the order.');
+    return data;
+}
+
+async function paypalCaptureOrder(paypalOrderId) {
+    const accessToken = await paypalAccessToken();
+    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}/capture`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.message || 'PayPal could not capture the payment.');
+    return data;
+}
+
+function getCapturedAmount(paypalResponse) {
+    const capture = paypalResponse?.purchase_units?.[0]?.payments?.captures?.[0];
+    return capture ? { status: capture.status, value: Number(capture?.amount?.value), currency: capture?.amount?.currency_code } : null;
+}
+
 function adminAuth(req, res, next) {
     if (!ADMIN_PASSWORD) return res.status(503).send('Admin password not configured.');
     const authHeader = req.headers.authorization || '';
@@ -257,10 +291,11 @@ function adminAuth(req, res, next) {
     next();
 }
 
+/* =========================================================
+   ROUTES
+   ========================================================= */
 app.get('/health', async (req, res) => {
-    let dbStatus = 'disabled';
-    if (db) { try { await db.query('SELECT 1'); dbStatus = 'connected'; } catch (err) { dbStatus = 'error'; } }
-    res.json({ ok: true, webhook: Boolean(DISCORD_WEBHOOK_URL), db: dbStatus });
+    res.json({ ok: true, webhook: Boolean(DISCORD_WEBHOOK_URL), db: dbReady ? 'connected' : 'error' });
 });
 
 app.get('/api/stats', trackingLimiter, async (req, res) => res.json(await getStats()));
@@ -275,27 +310,35 @@ app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
         const internalOrderId = createServerOrderId();
         const paypalOrder = await paypalCreateOrder(total, internalOrderId);
         if (!paypalOrder?.id) throw new Error('PayPal did not return an order ID.');
-        
         return res.json({ success: true, orderID: paypalOrder.id, total });
     } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
     try {
-        const { paypalOrderId, ign, discordUser, items, couponCode, imageProof } = req.body || {};
+        const { paypalOrderId, clientOrderId, ign, discordUser, items, couponCode } = req.body || {};
         if (!paypalOrderId) return res.status(400).json({ success: false, error: 'Order ID required.' });
         if (!isValidIgn(ign) || !isValidDiscordUser(discordUser)) return res.status(400).json({ success: false, error: 'Invalid user details.' });
+
+        // لو الأوردر ده اتعمله كابتشر قبل كده، منعملش حاجة ونرجع النجاح
+        const existingOrder = await findOrderById(clientOrderId);
+        if (existingOrder) {
+            return res.json({ success: true, orderId: existingOrder.id, total: existingOrder.total, status: existingOrder.status });
+        }
 
         const paypalResponse = await paypalCaptureOrder(paypalOrderId);
         const capture = getCapturedAmount(paypalResponse);
         
         if (!capture || capture.status !== 'COMPLETED') throw new Error('Payment not completed.');
+        if (capture.currency !== 'USD') throw new Error('Unexpected PayPal currency.');
 
         const cart = validateAndBuildCart(items);
         const total = calculateDiscountedTotal(cart.subtotal, couponCode);
-        
+
+        if (Number(capture.value) !== Number(total)) throw new Error('Payment amount mismatch.');
+
         const order = { 
-            id: createServerOrderId(), 
+            id: clientOrderId || createServerOrderId(), 
             ign: ign.trim(), 
             discordUser: normalizeText(discordUser, 100), 
             paymentMethod: 'PAYPAL', 
@@ -305,8 +348,7 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
             couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
             items: cart.items, 
             date: new Date().toISOString(), 
-            status: 'pending',
-            imageUrl: null
+            status: 'pending'
         };
         
         await addOrder(order);
@@ -316,40 +358,6 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
     } catch (error) {
         return res.status(500).json({ success: false, error: error.message });
     }
-});
-
-app.post('/api/new-order', orderLimiter, async (req, res) => {
-    try {
-        const { ign, discordUser, paymentMethod, items, couponCode, imageProof } = req.body || {};
-        
-        const method = String(paymentMethod || '').toUpperCase();
-        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser) || (method !== 'CRYPTO' && method !== 'PAYPAL') || typeof imageProof !== 'string') {
-            return res.status(400).json({ success: false, error: 'Invalid data.' });
-        }
-
-        const cart = validateAndBuildCart(items);
-        const total = calculateDiscountedTotal(cart.subtotal, couponCode);
-        
-        const order = { 
-            id: createServerOrderId(), 
-            ign: ign.trim(), 
-            discordUser: normalizeText(discordUser, 100), 
-            paymentMethod: method, 
-            paymentReference: 'Manual Payment', 
-            subtotal: cart.subtotal, 
-            total, 
-            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
-            items: cart.items, 
-            date: new Date().toISOString(), 
-            status: 'pending',
-            imageUrl: null
-        };
-        
-        await addOrder(order);
-        await sendDiscordWebhook(order, imageProof);
-        
-        return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
-    } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.get('/api/orders/:orderId', trackingLimiter, async (req, res) => {
@@ -428,8 +436,6 @@ const ADMIN_HTML = `<!DOCTYPE html>
   .btn-reset { background:#6366f1; color:#fff; }
   .btn-reset:hover { background:#4f46e5; }
   .btn-action:disabled { opacity:0.4; cursor:not-allowed; }
-  .btn-image { background:#3b82f6; color:#fff; text-decoration:none; display:inline-block; padding:7px 14px; border-radius:8px; font-weight:700; font-size:0.8rem; }
-  .btn-image:hover { background:#2563eb; }
   .empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
   .toast { position:fixed; bottom:30px; right:30px; background:var(--card); border:2px solid var(--accent); border-radius:12px; padding:16px 22px; font-weight:600; color:var(--text); box-shadow:0 10px 40px rgba(0,0,0,0.5); transform:translateY(100px); opacity:0; transition:all 0.3s; z-index:9999; max-width:350px; }
   .toast.show { transform:translateY(0); opacity:1; }
@@ -492,14 +498,13 @@ const ADMIN_HTML = `<!DOCTYPE html>
           <th>Method</th>
           <th>Items</th>
           <th>Total</th>
-          <th>Proof</th>
           <th>Status</th>
           <th>Date</th>
           <th>Actions</th>
         </tr>
       </thead>
       <tbody id="ordersTbody">
-        <tr><td colspan="9" class="empty-state">Loading...</td></tr>
+        <tr><td colspan="8" class="empty-state">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -584,7 +589,7 @@ function renderOrders() {
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No orders match your filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No orders match your filters.</td></tr>';
     return;
   }
 
@@ -593,11 +598,6 @@ function renderOrders() {
     var methodCls = o.paymentMethod === 'PAYPAL' ? 'method-paypal' : 'method-crypto';
     var itemsStr = Array.isArray(o.items) ? o.items.map(function (i) { return escapeHtml(i.title); }).join('<br>') : '—';
     var dateStr = o.date ? new Date(o.date).toLocaleString('en-GB') : '—';
-    
-    var proofHtml = '—';
-    if (o.imageUrl) {
-      proofHtml = '<a href="' + escapeHtml(o.imageUrl) + '" target="_blank" class="btn-image">View Proof</a>';
-    }
 
     return '<tr data-order-id="' + escapeHtml(o.id) + '">' +
       '<td><span class="order-id">' + escapeHtml(o.id) + '</span></td>' +
@@ -605,7 +605,6 @@ function renderOrders() {
       '<td><span class="method-badge ' + methodCls + '">' + escapeHtml(o.paymentMethod || '') + '</span></td>' +
       '<td>' + itemsStr + '</td>' +
       '<td><span class="total-cell">$' + Number(o.total || 0).toFixed(2) + '</span></td>' +
-      '<td>' + proofHtml + '</td>' +
       '<td><span class="status-badge ' + si.cls + '">' + si.icon + ' ' + si.label + '</span></td>' +
       '<td>' + escapeHtml(dateStr) + '</td>' +
       '<td><div class="actions-cell">' +
