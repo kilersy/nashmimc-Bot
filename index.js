@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + PayPal Capture)
+   NashmiMC Store — Webhook Only (Full Admin + PayPal Capture + Image Fix)
    ========================================================= */
 
 'use strict';
@@ -282,7 +282,7 @@ app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
 
 app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
     try {
-        const { paypalOrderId, ign, discordUser, items, couponCode } = req.body || {};
+        const { paypalOrderId, ign, discordUser, items, couponCode, imageProof } = req.body || {};
         if (!paypalOrderId) return res.status(400).json({ success: false, error: 'Order ID required.' });
         if (!isValidIgn(ign) || !isValidDiscordUser(discordUser)) return res.status(400).json({ success: false, error: 'Invalid user details.' });
 
