@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — Webhook Only (Full Admin + PayPal Route)
+   NashmiMC Store — Webhook Only (Full Admin + PayPal Capture)
    ========================================================= */
 
 'use strict';
@@ -25,8 +25,6 @@ const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'live').toLowerCase();
 const PAYPAL_BASE_URL = PAYPAL_MODE === 'sandbox'
     ? 'https://api-m.sandbox.paypal.com'
     : 'https://api-m.paypal.com';
-
-console.log('[STARTUP] Webhook URL:', DISCORD_WEBHOOK_URL ? 'SET' : 'MISSING!');
 
 /* =========================================================
    PRODUCT CATALOG
@@ -219,7 +217,7 @@ async function sendDiscordWebhook(order, imageProof = null) {
     try {
         console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
         
-        let content = `🛒 **New Manual Order!**\n` +
+        let content = `🛒 **New Order!**\n` +
             `- **Order ID:** #${order.id}\n` +
             `- **Player IGN:** \`${order.ign}\`\n` +
             `- **Discord:** \`${order.discordUser}\`\n` +
@@ -241,54 +239,6 @@ async function sendDiscordWebhook(order, imageProof = null) {
     } catch (error) {
         console.error('[WEBHOOK] Error sending to Discord:', error.message);
     }
-}
-
-/* =========================================================
-   PAYPAL HELPERS (Restored)
-   ========================================================= */
-function ensurePayPalConfigured() {
-    if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
-        throw new Error('PayPal environment variables are not configured.');
-    }
-}
-
-async function paypalAccessToken() {
-    ensurePayPalConfigured();
-    const credentials = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
-    const response = await fetch(`${PAYPAL_BASE_URL}/v1/oauth2/token`, {
-        method: 'POST', headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'grant_type=client_credentials'
-    });
-    const data = await response.json();
-    if (!response.ok || !data.access_token) throw new Error('Unable to authenticate with PayPal.');
-    return data.access_token;
-}
-
-async function paypalCreateOrder(total, internalOrderId) {
-    const accessToken = await paypalAccessToken();
-    const payload = { intent: 'CAPTURE', purchase_units: [{ reference_id: internalOrderId, amount: { currency_code: 'USD', value: Number(total).toFixed(2) } }] };
-    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'PayPal-Request-Id': internalOrderId },
-        body: JSON.stringify(payload)
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data?.message || 'PayPal could not create the order.');
-    return data;
-}
-
-async function paypalCaptureOrder(paypalOrderId) {
-    const accessToken = await paypalAccessToken();
-    const response = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}/capture`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({})
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data?.message || 'PayPal could not capture the payment.');
-    return data;
-}
-
-function getCapturedAmount(paypalResponse) {
-    const capture = paypalResponse?.purchase_units?.[0]?.payments?.captures?.[0];
-    return capture ? { status: capture.status, value: Number(capture?.amount?.value), currency: capture?.amount?.currency_code } : null;
 }
 
 function adminAuth(req, res, next) {
@@ -330,6 +280,44 @@ app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
     } catch (error) { return res.status(500).json({ success: false, error: error.message }); }
 });
 
+app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
+    try {
+        const { paypalOrderId, ign, discordUser, items, couponCode } = req.body || {};
+        if (!paypalOrderId) return res.status(400).json({ success: false, error: 'Order ID required.' });
+        if (!isValidIgn(ign) || !isValidDiscordUser(discordUser)) return res.status(400).json({ success: false, error: 'Invalid user details.' });
+
+        const paypalResponse = await paypalCaptureOrder(paypalOrderId);
+        const capture = getCapturedAmount(paypalResponse);
+        
+        if (!capture || capture.status !== 'COMPLETED') throw new Error('Payment not completed.');
+
+        const cart = validateAndBuildCart(items);
+        const total = calculateDiscountedTotal(cart.subtotal, couponCode);
+        
+        const order = { 
+            id: createServerOrderId(), 
+            ign: ign.trim(), 
+            discordUser: normalizeText(discordUser, 100), 
+            paymentMethod: 'PAYPAL', 
+            paymentReference: `PayPal: ${paypalOrderId}`, 
+            subtotal: cart.subtotal, 
+            total, 
+            couponCode: isValidCoupon(couponCode) ? VALID_COUPON : null, 
+            items: cart.items, 
+            date: new Date().toISOString(), 
+            status: 'pending',
+            imageUrl: null
+        };
+        
+        await addOrder(order);
+        await sendDiscordWebhook(order);
+
+        return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.post('/api/new-order', orderLimiter, async (req, res) => {
     try {
         const { ign, discordUser, paymentMethod, items, couponCode, imageProof } = req.body || {};
@@ -357,9 +345,7 @@ app.post('/api/new-order', orderLimiter, async (req, res) => {
             imageUrl: null
         };
         
-        const saved = await addOrder(order);
-        if (!saved) throw new Error('Failed to save order to database.');
-
+        await addOrder(order);
         await sendDiscordWebhook(order, imageProof);
         
         return res.json({ success: true, orderId: order.id, total: order.total, status: order.status });
