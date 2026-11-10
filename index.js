@@ -1,5 +1,5 @@
 /* =========================================================
-   NashmiMC Store — PayPal Automatic + Full Admin (Card Fix)
+   NashmiMC Store — PayPal Automatic + Full Admin (Secured)
    ========================================================= */
 
 'use strict';
@@ -125,7 +125,7 @@ app.use(express.urlencoded({ limit: '12mb', extended: true }));
 
 app.use((req, res, next) => {
     if (FRONTEND_URL) { res.header('Access-Control-Allow-Origin', FRONTEND_URL); res.header('Vary', 'Origin'); } else { res.header('Access-Control-Allow-Origin', '*'); }
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
@@ -207,30 +207,40 @@ function validateAndBuildCart(items) {
 async function sendDiscordWebhook(order) {
     if (!DISCORD_WEBHOOK_URL) return;
 
-    try {
-        console.log(`[WEBHOOK] Attempting to send order ${order.id} to Discord...`);
-        
-        let content = `🛒 **New Order!**\n` +
-            `- **Order ID:** #${order.id}\n` +
-            `- **Player IGN:** \`${order.ign}\`\n` +
-            `- **Discord:** \`${order.discordUser}\`\n` +
-            `- **Payment Method:** ${order.paymentMethod}\n` +
-            `- **Total:** $${Number(order.total).toFixed(2)}\n\n` +
-            `**Items:**\n${order.items.map(item => `• ${item.title} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
+    let content = `🛒 **New Order!**\n` +
+        `- **Order ID:** #${order.id}\n` +
+        `- **Player IGN:** \`${order.ign}\`\n` +
+        `- **Discord:** \`${order.discordUser}\`\n` +
+        `- **Payment Method:** ${order.paymentMethod}\n` +
+        `- **Total:** $${Number(order.total).toFixed(2)}\n\n` +
+        `**Items:**\n${order.items.map(item => `• ${item.title} - $${Number(item.price).toFixed(2)}`).join('\n')}`;
 
-        const response = await fetch(DISCORD_WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content })
-        });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            console.log(`[WEBHOOK] Attempt ${attempt} to send order ${order.id}...`);
+            const response = await fetch(DISCORD_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: content })
+            });
 
-        if (!response.ok) {
+            if (response.ok) {
+                console.log(`[WEBHOOK] Order ${order.id} sent to Discord.`);
+                return;
+            }
+
+            if (response.status === 429) {
+                console.warn(`[WEBHOOK] Rate limited (429). Waiting 2 seconds before retrying...`);
+                await new Promise(res => setTimeout(res, 2000));
+                continue;
+            }
+
             console.error(`[WEBHOOK] Failed to send. Status: ${response.status}`);
-        } else {
-            console.log(`[WEBHOOK] Order ${order.id} sent to Discord.`);
+            return;
+        } catch (error) {
+            console.error(`[WEBHOOK] Error sending to Discord (Attempt ${attempt}):`, error.message);
+            if (attempt < 3) await new Promise(res => setTimeout(res, 1000));
         }
-    } catch (error) {
-        console.error('[WEBHOOK] Error sending to Discord:', error.message);
     }
 }
 
@@ -298,7 +308,10 @@ app.get('/health', async (req, res) => {
     res.json({ ok: true, webhook: Boolean(DISCORD_WEBHOOK_URL), db: dbReady ? 'connected' : 'error' });
 });
 
-app.get('/api/stats', trackingLimiter, async (req, res) => res.json(await getStats()));
+// التعديل الأمني: حماية الـ stats بـ adminAuth
+app.get('/api/stats', adminAuth, async (req, res) => {
+    res.json(await getStats());
+});
 
 app.post('/api/paypal/create-order', orderLimiter, async (req, res) => {
     try {
@@ -328,7 +341,6 @@ app.post('/api/paypal/capture-order', orderLimiter, async (req, res) => {
         const paypalResponse = await paypalCaptureOrder(paypalOrderId);
         const capture = getCapturedAmount(paypalResponse);
         
-        // تعديل هام: بنقبل حالة COMPLETED أو PENDING
         if (!capture || (capture.status !== 'COMPLETED' && capture.status !== 'PENDING')) {
             throw new Error('Payment not completed or pending.');
         }
